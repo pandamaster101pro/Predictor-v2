@@ -381,6 +381,276 @@ def pareto_front(points_df, obj_a, obj_b, out, maximize_a=True, maximize_b=True,
 
 
 # =============================================================================
+# LATENT-VARIABLE CHARTS  (used by the Latent Variables tab)
+# =============================================================================
+# A small qualitative palette for coloring categories (e.g. by Material).
+_CAT_COLORS = [BLUE, AQUA, RED, "#f4a11a", "#8b5cf6", "#0ea5a5",
+               "#e05299", "#6b8f2e", "#3b6fb0", "#b5642e"]
+
+
+def explained_variance(evr, out, title="PCA explained variance"):
+    """Bar of per-component variance ratio + cumulative line (twin axis)."""
+    evr = np.asarray(evr, dtype=float)
+    if evr.size == 0:
+        return _placeholder(out, title, "No PCA components to show.")
+    cum = np.cumsum(evr)
+    x = np.arange(1, len(evr) + 1)
+    fig, ax = plt.subplots(figsize=(8, 4.6), facecolor=SURF)
+    style_ax(ax)
+    ax.bar(x, evr * 100, color=BLUE, width=0.66, label="per component")
+    ax.set_xlabel("principal component"); ax.set_ylabel("variance explained (%)")
+    ax.set_xticks(x)
+    ax2 = ax.twinx()
+    ax2.plot(x, cum * 100, color=RED, marker="o", ms=4, lw=1.6, label="cumulative")
+    ax2.set_ylabel("cumulative (%)", color=INK2)
+    ax2.set_ylim(0, 105)
+    ax2.tick_params(colors=MUTED, labelsize=8)
+    ax.set_title(title, fontsize=12, loc="left", fontweight="bold")
+    return _save(fig, out)
+
+
+def pca_score_scatter(scores_df, color_series, out, pc_x="PC1", pc_y="PC2",
+                      color_name="Material", title="PCA scores"):
+    """Scatter of two PCs, colored by a categorical series (e.g. Material)."""
+    if pc_x not in scores_df.columns or pc_y not in scores_df.columns:
+        return _placeholder(out, title, "Need at least two principal components.")
+    fig, ax = plt.subplots(figsize=(7.6, 6.2), facecolor=SURF)
+    style_ax(ax)
+    if color_series is not None:
+        cats = pd.Series(color_series).astype(str).to_numpy()
+        for i, cat in enumerate(pd.unique(cats)):
+            m = cats == cat
+            ax.scatter(scores_df.loc[m, pc_x], scores_df.loc[m, pc_y], s=26,
+                       color=_CAT_COLORS[i % len(_CAT_COLORS)], alpha=0.75,
+                       edgecolors="none", label=short(cat, 18))
+        ax.legend(loc="best", fontsize=7, facecolor=SURF, edgecolor=GRID,
+                  title=short(color_name, 18), title_fontsize=7)
+    else:
+        ax.scatter(scores_df[pc_x], scores_df[pc_y], s=26, color=BLUE, alpha=0.7,
+                   edgecolors="none")
+    ax.set_title(f"{title}  ·  colored by {short(color_name, 18)}",
+                 fontsize=12, loc="left", fontweight="bold")
+    ax.set_xlabel(pc_x); ax.set_ylabel(pc_y)
+    return _save(fig, out)
+
+
+def pca_loading_bar(loadings, out, pc="PC1", top=15, title="PCA loadings"):
+    """Horizontal bar of the largest-magnitude loadings for one component."""
+    if pc not in loadings.columns:
+        return _placeholder(out, title, f"Component {pc} not found.")
+    s = loadings[pc]
+    s = s.reindex(s.abs().sort_values(ascending=False).index).head(top)[::-1]
+    fig, ax = plt.subplots(figsize=(8.5, max(3.2, 0.42 * len(s) + 1.2)), facecolor=SURF)
+    style_ax(ax)
+    colors = [BLUE if v >= 0 else RED for v in s.values]
+    ax.barh(range(len(s)), s.values, color=colors, height=0.72)
+    ax.axvline(0, color=GRID, lw=1)
+    ax.set_yticks(range(len(s))); ax.set_yticklabels([short(f, 28) for f in s.index], fontsize=8)
+    ax.set_title(f"{title}  ·  {pc}  (blue +   red −)", fontsize=12, loc="left", fontweight="bold")
+    ax.set_xlabel("loading")
+    return _save(fig, out)
+
+
+def pipeline_comparison_bar(results, out, metric="r2", title=None):
+    """
+    Grouped bar of pipeline A/B/C performance per model, with std error bars.
+    `results` is the dict from latent.compare_pipelines.
+    `metric` in {"r2","rmse","mae"}.
+    """
+    variants = ["A", "B", "C"]
+    labels = {"A": "A: original", "B": "B: latent", "C": "C: both"}
+    models = results.get("_meta", {}).get("models") or ["ExtraTrees"]
+    have = False
+    fig, ax = plt.subplots(figsize=(8.4, 5.0), facecolor=SURF)
+    style_ax(ax)
+    width = 0.8 / max(1, len(models))
+    x = np.arange(len(variants))
+    for j, m in enumerate(models):
+        means, errs = [], []
+        for v in variants:
+            sc = results.get(v, {}).get(m, {})
+            means.append(sc.get(f"{metric}_mean", np.nan))
+            errs.append(sc.get(f"{metric}_std", 0.0))
+            have = have or (f"{metric}_mean" in sc)
+        ax.bar(x + j * width, means, width=width * 0.95, yerr=errs, capsize=3,
+               color=_CAT_COLORS[j % len(_CAT_COLORS)], label=m,
+               error_kw=dict(ecolor=MUTED, lw=1))
+    if not have:
+        return _placeholder(out, "Pipeline comparison", "No results to plot.")
+    ax.set_xticks(x + width * (len(models) - 1) / 2)
+    ax.set_xticklabels([labels[v] for v in variants], fontsize=9)
+    ax.set_ylabel(f"CV {metric.upper()}  (mean ± std)")
+    ax.set_title(title or f"Pipeline comparison · {metric.upper()}",
+                 fontsize=12, loc="left", fontweight="bold")
+    ax.legend(loc="best", fontsize=8, facecolor=SURF, edgecolor=GRID)
+    return _save(fig, out)
+
+
+# =============================================================================
+# DATASET-INTELLIGENCE CHARTS
+# =============================================================================
+def ranked_bar(series, out, title="Ranking", xlabel="value", top=15,
+               diverging=False):
+    """Horizontal bar of a {label: value} Series, largest-magnitude first."""
+    s = pd.Series(dict(series)) if not isinstance(series, pd.Series) else series
+    s = s.dropna()
+    if s.empty:
+        return _placeholder(out, title, "Nothing to rank.")
+    s = s.reindex(s.abs().sort_values(ascending=False).index).head(top)[::-1]
+    fig, ax = plt.subplots(figsize=(8.5, max(3.2, 0.42 * len(s) + 1.2)), facecolor=SURF)
+    style_ax(ax)
+    colors = ([BLUE if v >= 0 else RED for v in s.values] if diverging else BLUE)
+    ax.barh(range(len(s)), s.values, color=colors, height=0.72)
+    if diverging:
+        ax.axvline(0, color=GRID, lw=1)
+    ax.set_yticks(range(len(s))); ax.set_yticklabels([short(f, 30) for f in s.index], fontsize=8)
+    ax.set_title(title, fontsize=12, loc="left", fontweight="bold")
+    ax.set_xlabel(xlabel)
+    return _save(fig, out)
+
+
+def target_distribution(values, out, target_name="target", stats=None):
+    """Histogram + box plot + QQ plot in one figure, annotated with shape stats."""
+    y = np.asarray(values, dtype=float)
+    y = y[np.isfinite(y)]
+    if y.size < 3:
+        return _placeholder(out, "Target analysis", "Too few target values.")
+    fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.4), facecolor=SURF)
+    for ax in axes:
+        style_ax(ax)
+    # Histogram + median line.
+    axes[0].hist(y, bins=24, color=BLUE, edgecolor=SURF, linewidth=0.6)
+    axes[0].axvline(np.median(y), color=RED, lw=1.4, ls="--")
+    axes[0].set_title("Histogram", fontsize=10, loc="left", fontweight="bold")
+    axes[0].set_xlabel(short(target_name, 24)); axes[0].set_ylabel("count")
+    # Box plot.
+    bp = axes[1].boxplot(y, vert=True, widths=0.5, patch_artist=True)
+    for patch in bp["boxes"]:
+        patch.set(facecolor=AQUA, alpha=0.5, edgecolor=INK2)
+    for med in bp["medians"]:
+        med.set(color=RED, linewidth=1.5)
+    axes[1].set_title("Box plot", fontsize=10, loc="left", fontweight="bold")
+    axes[1].set_xticks([])
+    # QQ plot vs normal.
+    try:
+        from scipy import stats as _st
+        _st.probplot(y, dist="norm", plot=axes[2])
+        axes[2].get_lines()[0].set(marker="o", ms=4, color=BLUE, alpha=0.6, ls="")
+        axes[2].get_lines()[1].set(color=RED, lw=1.4)
+    except Exception:  # noqa: BLE001
+        axes[2].scatter(np.sort(y), np.linspace(0, 1, len(y)), s=10, color=BLUE)
+    axes[2].set_title("QQ plot (normal)", fontsize=10, loc="left", fontweight="bold")
+
+    sub = ""
+    if stats:
+        sub = (f"skew={stats.get('skewness', float('nan')):.2f}  ·  "
+               f"kurtosis={stats.get('kurtosis', float('nan')):.2f}  ·  "
+               f"normal={'yes' if stats.get('is_normal') else 'no'}  ·  "
+               f"outliers={stats.get('n_outliers', 0)}")
+    fig.suptitle(f"Target distribution · {short(target_name, 28)}   {sub}",
+                 color=INK, fontsize=12, fontweight="bold", x=0.02, ha="left")
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    return _save(fig, out)
+
+
+def causal_diagram(structure_present, out, message="",
+                   title="Causal pipeline"):
+    """Boxes+arrows: Material/Pretreat/Pyrolysis -> Carbon Structure -> Capacity.
+
+    The 'Carbon Structure' node is drawn dashed when structural descriptors are
+    absent from the dataset.
+    """
+    from matplotlib.patches import FancyBboxPatch, FancyArrowPatch
+
+    fig, ax = plt.subplots(figsize=(10, 5.2), facecolor=SURF)
+    ax.set_xlim(0, 10); ax.set_ylim(0, 6); ax.axis("off")
+
+    def box(x, y, text, dashed=False, color=BLUE):
+        style = "round,pad=0.1"
+        p = FancyBboxPatch((x - 1.05, y - 0.42), 2.1, 0.84, boxstyle=style,
+                           linewidth=1.6, edgecolor=color, facecolor=SURF,
+                           linestyle="--" if dashed else "-")
+        ax.add_patch(p)
+        ax.text(x, y, text, ha="center", va="center", fontsize=9,
+                color=MUTED if dashed else INK, fontweight="bold")
+        return (x, y)
+
+    def arrow(a, b, dashed=False):
+        ax.add_patch(FancyArrowPatch(a, b, arrowstyle="-|>", mutation_scale=14,
+                                     color=MUTED, lw=1.3,
+                                     linestyle="--" if dashed else "-",
+                                     shrinkA=42, shrinkB=42))
+
+    mat = box(1.5, 5.0, "Material")
+    pre = box(1.5, 3.0, "Pretreatment")
+    pyr = box(1.5, 1.0, "Pyrolysis")
+    struct = box(5.0, 3.0, "Carbon Structure", dashed=not structure_present,
+                 color=(AQUA if structure_present else MUTED))
+    cap = box(8.5, 3.0, "Capacity", color=GOOD)
+    for src in (mat, pre, pyr):
+        arrow(src, struct, dashed=not structure_present)
+    arrow(struct, cap, dashed=not structure_present)
+
+    ax.set_title(title, fontsize=13, loc="left", fontweight="bold")
+    if message:
+        ax.text(5.0, 2.35, message, ha="center", va="center", fontsize=8,
+                color=RED, style="italic")
+    return _save(fig, out)
+
+
+def radar_chart(labels, values, out, title="Latent contribution"):
+    """Radar/spider chart of {label: value} (e.g. latent contributions)."""
+    labels = list(labels); vals = list(values)
+    if len(labels) < 3:
+        return _placeholder(out, title, "Need at least three axes for a radar chart.")
+    ang = np.linspace(0, 2 * np.pi, len(labels), endpoint=False).tolist()
+    vals = vals + vals[:1]; ang = ang + ang[:1]
+    fig, ax = plt.subplots(figsize=(6.6, 6.6), subplot_kw=dict(polar=True), facecolor=SURF)
+    ax.set_facecolor(SURF)
+    ax.plot(ang, vals, color=BLUE, lw=1.8)
+    ax.fill(ang, vals, color=BLUE, alpha=0.25)
+    ax.set_xticks(ang[:-1])
+    ax.set_xticklabels([short(l, 18) for l in labels], fontsize=8, color=INK2)
+    ax.tick_params(colors=MUTED, labelsize=7)
+    ax.set_title(title, fontsize=12, fontweight="bold", color=INK, pad=18)
+    return _save(fig, out)
+
+
+def biplot(scores_df, loadings, out, color_series=None, pc_x="PC1", pc_y="PC2",
+           color_name="Material", top_loadings=8, title="PCA biplot"):
+    """Score scatter overlaid with the strongest loading vectors."""
+    if pc_x not in scores_df.columns or pc_y not in scores_df.columns:
+        return _placeholder(out, title, "Need at least two principal components.")
+    fig, ax = plt.subplots(figsize=(8, 6.8), facecolor=SURF)
+    style_ax(ax)
+    if color_series is not None:
+        cats = pd.Series(color_series).astype(str).to_numpy()
+        for i, cat in enumerate(pd.unique(cats)):
+            m = cats == cat
+            ax.scatter(scores_df.loc[m, pc_x], scores_df.loc[m, pc_y], s=20,
+                       color=_CAT_COLORS[i % len(_CAT_COLORS)], alpha=0.6,
+                       edgecolors="none", label=short(cat, 16))
+        ax.legend(loc="best", fontsize=7, facecolor=SURF, edgecolor=GRID,
+                  title=short(color_name, 16), title_fontsize=7)
+    else:
+        ax.scatter(scores_df[pc_x], scores_df[pc_y], s=20, color=BLUE, alpha=0.6,
+                   edgecolors="none")
+    # Scale loading arrows to the score cloud.
+    if pc_x in loadings.columns and pc_y in loadings.columns:
+        span = float(np.nanmax(np.abs(scores_df[[pc_x, pc_y]].to_numpy()))) or 1.0
+        lmag = loadings[[pc_x, pc_y]].abs().sum(axis=1).sort_values(ascending=False)
+        for feat in lmag.head(top_loadings).index:
+            vx, vy = loadings.loc[feat, pc_x], loadings.loc[feat, pc_y]
+            ax.annotate("", xy=(vx * span, vy * span), xytext=(0, 0),
+                        arrowprops=dict(arrowstyle="-|>", color=RED, lw=1.2))
+            ax.text(vx * span * 1.08, vy * span * 1.08, short(feat, 16),
+                    color=RED, fontsize=7, ha="center", va="center")
+    ax.set_title(title, fontsize=12, loc="left", fontweight="bold")
+    ax.set_xlabel(pc_x); ax.set_ylabel(pc_y)
+    return _save(fig, out)
+
+
+# =============================================================================
 # HEAD-LESS SELF TEST  ->  python charts.py
 # =============================================================================
 def _selftest(out_dir="charts"):

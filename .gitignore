@@ -9,6 +9,14 @@ venv/
 *.joblib
 predictions.csv
 
+# Latent Variables tab exports
+latent_export.xlsx
+pca_loadings.csv
+latent_comparison.csv
+
+# Dataset Intelligence report
+intelligence_report.pdf
+
 # CatBoost training logs
 catboost_info/
 

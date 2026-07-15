@@ -79,7 +79,7 @@ import numpy as np
 import time
 import pandas as pd
 import joblib
-from sklearn.model_selection import KFold, cross_val_predict, train_test_split
+from sklearn.model_selection import KFold, cross_val_predict
 from sklearn.ensemble import ExtraTreesRegressor, StackingRegressor
 from sklearn.linear_model import Ridge
 from sklearn.svm import SVR
@@ -90,6 +90,8 @@ from sklearn.pipeline import make_pipeline
 from scipy.optimize import differential_evolution
 from sklearn.metrics import r2_score, mean_squared_error
 from imgui_bundle import imgui, immapp, hello_imgui, portable_file_dialogs as pfd
+import latent
+import intelligence
 
 MODEL_OUT = "model.joblib"
 RANDOM_STATE = 42
@@ -596,8 +598,7 @@ class AppState:
         self.cfg = {}                      # {ids, mixed} used at train time
 
         # --- Evaluation results for display ---
-        self.test_size = 0.2               # held-out test fraction for train/test eval
-        self.metrics = []                  # [(target, tr_r2, tr_rmse, te_r2, te_rmse), ...]
+        self.metrics = []                  # [(target, tr_r2, tr_rmse, cv_r2, cv_rmse), ...]
         self.importances = []             # [(feature, importance), ...]
         self.summary = ""
 
@@ -659,6 +660,37 @@ class AppState:
         self.charts_error = ""
         self.chart_items = []              # [(title, rel_path), ...] rendered PNGs
         self.charts_run = 0                # bumped each run -> unique names (texture cache)
+
+        # --- Latent Variables tab ---
+        self.lat_columns = []              # available columns (from file/sheet)
+        self.lat_target_idx = 0
+        self.lat_categorical = ", ".join(latent.DEFAULT_CATEGORICAL)
+        self.lat_numerical = ", ".join(latent.DEFAULT_NUMERICAL)
+        self.lat_excluded = ""
+        self.lat_chem_w = [1.0, 1.0, 1.0]  # editable chemical-index weights
+        self.lat_biomass_pca = False       # False = equal-weight mean, True = PCA-1
+        self.lat_pca_components = 3         # 2-10
+        self.lat_pls_components = 2         # 1-10
+        self.is_lat_running = False
+        self.lat_status = "Choose a file (Train tab), Scan columns, then Run analysis."
+        self.lat_error = ""
+        self.lat_run = 0                   # unique chart filenames
+        self.lat_pls_result = None
+        self.lat_compare_result = None
+        self.lat_chart_items = []          # [(title, rel_path), ...]
+        self.lat_last = {}                 # cached df/config/pca for exports
+
+        # --- Dataset Intelligence tab ---
+        self.intel_target_idx = 0          # which configured target to analyse
+        self.intel_pca_components = 4       # interactive PCA component selector (2-10)
+        self.is_intel_running = False
+        self.intel_status = "Configure columns in the Train / Column types tab, then Run."
+        self.intel_error = ""
+        self.intel_run = 0                 # unique chart filenames
+        self.intel_results = None          # dict of all section results
+        self.intel_chart_items = []        # [(title, rel_path), ...]
+        self.intel_insights = []           # AI Research Assistant lines
+        self.intel_conclusion = ""
 
 
 STATE = AppState()
@@ -842,7 +874,6 @@ def start_training():
         targets=_split_cols(STATE.target_columns),
         col_types=dict(STATE.coltype_map),       # manual numeric/categorical overrides
         exclude=_split_cols(STATE.exclude_columns),  # cols dropped from training
-        test_size=float(STATE.test_size),        # held-out fraction for train/test eval
         sheet=_current_sheet(),                  # selected worksheet/tab
     )
     threading.Thread(target=_train_worker, args=(cfg,), daemon=True).start()
@@ -877,38 +908,35 @@ def _train_worker(cfg):
             )
         )
 
-        # EVALUATION: hold out a random test split, fit on the TRAINING rows only,
-        # then score both the training rows and the held-out test rows. Comparing
-        # the two shows the train-vs-test gap (a large gap flags overfitting).
-        test_size = float(cfg.get("test_size", 0.2))
-        pct_tr = int(round((1 - test_size) * 100))
-        pct_te = int(round(test_size * 100))
-        STATE.status = f"Evaluating with a {pct_tr}/{pct_te} train/test split…"
-        STATE.progress = 0.55
-        X_tr, X_te, y_tr, y_te = train_test_split(
-            X_enc, y, test_size=test_size, random_state=RANDOM_STATE
-        )
-        model.fit(X_tr, y_tr)
-        pred_tr = model.predict(X_tr)
-        pred_te = model.predict(X_te)
-        metrics = []
-        for i, col in enumerate(targets):
-            tr_r2 = r2_score(y_tr.iloc[:, i], pred_tr[:, i])
-            tr_rmse = float(np.sqrt(mean_squared_error(y_tr.iloc[:, i], pred_tr[:, i])))
-            te_r2 = r2_score(y_te.iloc[:, i], pred_te[:, i])
-            te_rmse = float(np.sqrt(mean_squared_error(y_te.iloc[:, i], pred_te[:, i])))
-            metrics.append((col, tr_r2, tr_rmse, te_r2, te_rmse))
+        # EVALUATION: 5-fold out-of-fold cross-validation. Every row is predicted
+        # by a model that never saw it, giving a stable generalization estimate
+        # (matches the Compare-models tab) instead of one volatile hold-out split.
+        STATE.status = "Evaluating with 5-fold cross-validation…"
+        STATE.progress = 0.5
+        cv = KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+        pred_cv = cross_val_predict(model, X_enc, y, cv=cv, n_jobs=-1)
 
-        # Fit the DEPLOYABLE model on ALL rows (train+test) for the Predict tab.
+        # Fit the DEPLOYABLE model on ALL rows for the Predict tab + in-sample fit.
         STATE.status = "Fitting final model on all rows…"
         STATE.progress = 0.9
         model.fit(X_enc, y)
+        pred_tr = model.predict(X_enc)   # in-sample (training-fit) predictions
         importances = np.mean(
             [est.feature_importances_ for est in model.estimators_], axis=0
         )
         imp_series = pd.Series(importances, index=X_enc.columns).sort_values(
             ascending=False
         )
+
+        # Per-target metrics: in-sample train fit vs 5-fold cross-validation.
+        # A large train-vs-CV gap still flags overfitting.
+        metrics = []
+        for i, col in enumerate(targets):
+            tr_r2 = r2_score(y.iloc[:, i], pred_tr[:, i])
+            tr_rmse = float(np.sqrt(mean_squared_error(y.iloc[:, i], pred_tr[:, i])))
+            cv_r2 = r2_score(y.iloc[:, i], pred_cv[:, i])
+            cv_rmse = float(np.sqrt(mean_squared_error(y.iloc[:, i], pred_cv[:, i])))
+            metrics.append((col, tr_r2, tr_rmse, cv_r2, cv_rmse))
 
         # Publish results to the UI.
         STATE.model = model
@@ -920,10 +948,10 @@ def _train_worker(cfg):
         STATE.metrics = metrics
         STATE.importances = list(imp_series.items())
         mean_tr = float(np.mean([m[1] for m in metrics]))
-        mean_te = float(np.mean([m[3] for m in metrics]))
+        mean_cv = float(np.mean([m[3] for m in metrics]))
         STATE.summary = (
-            f"ExtraTrees · {len(X_tr)} train / {len(X_te)} test rows.  "
-            f"Train R2 = {mean_tr:.3f}  ·  Test R2 = {mean_te:.3f}  ·  "
+            f"ExtraTrees · 5-fold CV on {len(X_enc)} rows.  "
+            f"Train R2 = {mean_tr:.3f}  ·  CV R2 = {mean_cv:.3f}  ·  "
             f"{len(feature_columns)} encoded features.  "
             + "  ".join(clean_notes)
         )
@@ -1204,6 +1232,350 @@ def _charts_worker(cfg, opts):
 
 
 # =============================================================================
+# LATENT VARIABLES  (engineered indices + PCA/PLS + leakage-safe A/B/C compare)
+# =============================================================================
+def lat_scan_columns():
+    """Populate the target dropdown + default exclusions from the chosen file/tab."""
+    if not STATE.data_path:
+        STATE.lat_status = "Choose a spreadsheet in the Train tab first."
+        return
+    try:
+        df = read_any(STATE.data_path, nrows=50, sheet=_current_sheet())
+        STATE.lat_columns = [str(c) for c in df.columns]
+        # Default the target to the first capacity column present, else first column.
+        caps = [c for c in latent.CAPACITY_TARGETS if c in STATE.lat_columns]
+        target = caps[0] if caps else (STATE.lat_columns[0] if STATE.lat_columns else "")
+        if target in STATE.lat_columns:
+            STATE.lat_target_idx = STATE.lat_columns.index(target)
+        STATE.lat_excluded = ", ".join(latent.default_excluded(target, STATE.lat_columns))
+        STATE.lat_status = f"Scanned {len(STATE.lat_columns)} columns. Adjust, then Run analysis."
+    except Exception as e:  # noqa: BLE001
+        STATE.lat_status = f"Scan failed: {e}"
+
+
+def _lat_current_config():
+    "grade in current config"
+    """Assemble a latent.LatentConfig from the current UI fields."""
+    target = (STATE.lat_columns[STATE.lat_target_idx]
+              if 0 <= STATE.lat_target_idx < len(STATE.lat_columns) else "")
+    return latent.LatentConfig(
+        target=target,
+        categorical=_split_cols(STATE.lat_categorical),
+        numerical=_split_cols(STATE.lat_numerical),
+        excluded=_split_cols(STATE.lat_excluded),
+        chem_weights=tuple(float(w) for w in STATE.lat_chem_w),
+        biomass_method="pca" if STATE.lat_biomass_pca else "mean",
+    )
+
+
+def start_latent():
+    """Kick off the full latent-variable analysis on a background thread."""
+    if STATE.is_lat_running or not STATE.data_path:
+        return
+    if not STATE.lat_columns:
+        lat_scan_columns()
+    STATE.is_lat_running = True
+    STATE.lat_error = ""
+    STATE.lat_chart_items = []
+    STATE.lat_status = "Starting…"
+    cfg = _lat_current_config()
+    opts = dict(sheet=_current_sheet(), n_pca=int(STATE.lat_pca_components),
+                n_pls=int(STATE.lat_pls_components))
+    threading.Thread(target=_latent_worker, args=(cfg, opts), daemon=True).start()
+
+
+def _latent_worker(cfg, opts):
+    import charts as C
+    try:
+        os.makedirs(CHART_DIR, exist_ok=True)
+        STATE.lat_run += 1
+        rid = STATE.lat_run
+
+        def path(name):
+            return f"{CHART_DIR}/lat_{name}_{rid}.png"
+
+        STATE.lat_status = "Loading data…"
+        df = read_any(STATE.data_path, sheet=opts["sheet"])
+        if cfg.target not in df.columns:
+            raise ValueError(f"Target '{cfg.target}' not found. Scan columns first.")
+
+        items = []
+
+        # A. Engineered indices (full-data, for display/export + correlation chart).
+        STATE.lat_status = "Computing engineered indices…"
+        eng = latent.compute_engineered_latents(df, cfg.chem_weights, cfg.biomass_method)
+        corr_df = pd.concat(
+            [eng.reset_index(drop=True),
+             pd.to_numeric(df[cfg.target], errors="coerce").reset_index(drop=True)],
+            axis=1)
+        items.append(("Engineered latents vs target (correlation)",
+                      C.correlation_heatmap(corr_df, path("eng_corr"),
+                                            title="Engineered latents vs target")))
+
+        # B. PCA (full-data fit for display) + its three charts.
+        STATE.lat_status = "Fitting PCA…"
+        pca = latent.fit_pca(df, cfg, opts["n_pca"])
+        items.append(("PCA explained variance",
+                      C.explained_variance(pca["explained_variance_ratio"], path("evr"))))
+        material = df["Material"] if "Material" in df.columns else None
+        items.append(("PCA scores",
+                      C.pca_score_scatter(pca["scores"], material, path("scores"),
+                                          color_name="Material")))
+        items.append(("PCA loadings (PC1)",
+                      C.pca_loading_bar(pca["loadings"], path("load"), pc="PC1")))
+
+        # PLS 5-fold CV.
+        STATE.lat_status = "Cross-validating PLS…"
+        pls = latent.evaluate_pls(df, cfg, opts["n_pls"])
+
+        # C. Pipeline comparison A/B/C (leakage-safe).
+        def prog(msg):
+            STATE.lat_status = msg
+        comp = latent.compare_pipelines(df, cfg, n_pca=opts["n_pca"], progress=prog)
+        for metric in ("r2", "rmse", "mae"):
+            items.append((f"Pipeline A/B/C · {metric.upper()}",
+                          C.pipeline_comparison_bar(comp, path(f"cmp_{metric}"), metric=metric)))
+
+        # Actual-vs-predicted + residuals for the strongest pipeline (C).
+        STATE.lat_status = "Out-of-fold predictions (pipeline C)…"
+        y_true, y_pred, used = latent.oof_predict(df, cfg, variant="C",
+                                                  n_pca=opts["n_pca"])
+        r2 = {cfg.target: float(r2_score(y_true, y_pred))}
+        items.append((f"Actual vs predicted (C · {used})",
+                      C.predicted_vs_actual(y_true, y_pred, [cfg.target],
+                                            path("ava"), r2)))
+        items.append((f"Residuals (C · {used})",
+                      C.residual_plot(y_true, y_pred, [cfg.target], path("resid"))))
+
+        # Publish.
+        STATE.lat_pls_result = pls
+        STATE.lat_compare_result = comp
+        STATE.lat_chart_items = items
+        STATE.lat_last = {"cfg": cfg, "sheet": opts["sheet"], "pca": pca,
+                          "n_pca": opts["n_pca"]}
+        STATE.lat_status = (f"Done. PLS(k={pls['n_components']}) CV R²="
+                            f"{pls['r2_mean']:.3f}±{pls['r2_std']:.3f}. See charts below.")
+    except Exception as e:  # noqa: BLE001
+        STATE.lat_error = f"{type(e).__name__}: {e}"
+        STATE.lat_status = "Latent analysis failed."
+    finally:
+        STATE.is_lat_running = False
+
+
+def lat_export(kind):
+    """Export latent artifacts to files in the working directory."""
+    last = STATE.lat_last
+    if not last:
+        STATE.lat_status = "Run the analysis first."
+        return
+    cfg = last["cfg"]
+    try:
+        df = read_any(STATE.data_path, sheet=last["sheet"])
+        if kind == "xlsx":
+            frame = latent.build_export_frame(df, cfg, last["pca"]["scores"])
+            frame.to_excel("latent_export.xlsx", index=False)
+            STATE.lat_status = f"Saved latent_export.xlsx ({len(frame)} rows)."
+        elif kind == "loadings":
+            last["pca"]["loadings"].to_csv("pca_loadings.csv")
+            STATE.lat_status = "Saved pca_loadings.csv."
+        elif kind == "comparison":
+            latent.comparison_to_frame(STATE.lat_compare_result).to_csv(
+                "latent_comparison.csv", index=False)
+            STATE.lat_status = "Saved latent_comparison.csv."
+        elif kind == "pipeline":
+            pipe = latent.fit_full_pipeline(df, cfg, variant="C", n_pca=last["n_pca"])
+            joblib.dump({"pipeline": pipe, "target": cfg.target,
+                         "categorical": cfg.categorical, "numerical": cfg.numerical},
+                        "latent_pipeline.joblib")
+            STATE.lat_status = "Saved latent_pipeline.joblib."
+    except Exception as e:  # noqa: BLE001
+        STATE.lat_error = f"Export failed: {e}"
+
+
+# =============================================================================
+# DATASET INTELLIGENCE  (why prediction succeeds / fails — reuses Train config)
+# =============================================================================
+def _configured_targets():
+    """Targets currently configured in the Train / Column types tabs."""
+    roles = [c for c in STATE.coltype_columns if STATE.coltype_role.get(c) == "target"]
+    return roles or _split_cols(STATE.target_columns)
+
+
+def _intel_config(target):
+    """
+    Build a leakage-safe latent.LatentConfig from the EXISTING Train / Column
+    types selections — no duplicate configuration in the Intelligence tab.
+    Categorical/numerical come from the Column types roles when available, else
+    from the latent defaults filtered to the file's columns.
+    """
+    all_targets = _configured_targets()
+    if STATE.coltype_columns:
+        cat = [c for c in STATE.coltype_columns
+               if STATE.coltype_role.get(c) == "feature"
+               and STATE.coltype_map.get(c) == "categorical"]
+        num = [c for c in STATE.coltype_columns
+               if STATE.coltype_role.get(c) == "feature"
+               and STATE.coltype_map.get(c) == "numeric"]
+        excluded = [c for c in STATE.coltype_columns
+                    if STATE.coltype_role.get(c) in ("exclude", "id")]
+    else:  # fall back to the latent recommended defaults
+        cat = list(latent.DEFAULT_CATEGORICAL)
+        num = list(latent.DEFAULT_NUMERICAL)
+        excluded = list(latent.DEFAULT_ALWAYS_EXCLUDE)
+    excluded += [t for t in all_targets if t != target]  # never leak other targets
+    return latent.LatentConfig(
+        target=target, categorical=cat, numerical=num, excluded=excluded,
+        chem_weights=tuple(float(w) for w in STATE.lat_chem_w),
+        biomass_method="pca" if STATE.lat_biomass_pca else "mean")
+
+
+def start_intelligence():
+    """Kick off the full Dataset Intelligence analysis on a background thread."""
+    if STATE.is_intel_running or not STATE.data_path:
+        return
+    targets = _configured_targets()
+    if not targets:
+        STATE.intel_status = "Set at least one Target in the Train / Column types tab first."
+        return
+    ti = min(STATE.intel_target_idx, len(targets) - 1)
+    STATE.is_intel_running = True
+    STATE.intel_error = ""
+    STATE.intel_chart_items = []
+    STATE.intel_results = None
+    STATE.intel_status = "Starting…"
+    cfg = _intel_config(targets[ti])
+    opts = dict(sheet=_current_sheet(), n_pca=int(STATE.intel_pca_components))
+    threading.Thread(target=_intel_worker, args=(cfg, opts), daemon=True).start()
+
+
+def _intel_worker(cfg, opts):
+    """Run all 10 sections + AI insights, generate charts, cache for the report."""
+    import charts as C
+    try:
+        os.makedirs(CHART_DIR, exist_ok=True)
+        STATE.intel_run += 1
+        rid = STATE.intel_run
+
+        def path(name):
+            return f"{CHART_DIR}/intel_{name}_{rid}.png"
+
+        def prog(msg):
+            STATE.intel_status = msg
+
+        prog("Loading data…")
+        df = read_any(STATE.data_path, sheet=opts["sheet"])
+        if cfg.target not in df.columns:
+            raise ValueError(f"Target '{cfg.target}' not found in the sheet.")
+
+        prog("1/9 · dataset summary…")
+        summary = intelligence.dataset_summary(df, cfg)
+        prog("2/9 · predictability…")
+        pred = intelligence.predictability(df, cfg)
+        prog("3/9 · redundancy / VIF…")
+        redund = intelligence.redundancy(df, cfg)
+        prog("4/9 · learnability (5-fold CV)…")
+        learn = intelligence.learnability(df, cfg, progress=prog)
+        diff = intelligence.difficulty_score(summary, pred, learn)
+        prog("6/9 · causal structure…")
+        causal = intelligence.causal_structure(df)
+        prog("7/9 · latent analysis…")
+        lat = intelligence.latent_analysis(df, cfg)
+        prog("8/9 · target analysis…")
+        tgt = intelligence.target_analysis(df, cfg)
+        prog("9/9 · PCA…")
+        pca = latent.fit_pca(df, cfg, opts["n_pca"])
+
+        # ---- Charts (reuse existing plotting code) ----
+        items = []
+        cat, num = cfg.feature_columns(list(df.columns))
+        # Predictability
+        strength = pred["table"].set_index("feature")["mutual_info"]
+        items.append(("Predictability — mutual information",
+                      C.ranked_bar(strength, path("predict"),
+                                   title="Feature → target mutual information",
+                                   xlabel="mutual information")))
+        corr_cols = num + [cfg.target]
+        items.append(("Correlation heatmap",
+                      C.correlation_heatmap(df[corr_cols].apply(pd.to_numeric, errors="coerce"),
+                                            path("corr"), title="Feature correlation")))
+        # Redundancy — VIF
+        vif_ser = pd.Series({k: v for k, v in redund["vif"].items() if np.isfinite(v)})
+        items.append(("Feature redundancy — VIF",
+                      C.ranked_bar(vif_ser, path("vif"),
+                                   title="Variance Inflation Factor (>10 = redundant)",
+                                   xlabel="VIF")))
+        # Learnability comparison
+        learn_r2 = pd.Series({n: s["r2_mean"] for n, s in learn["results"].items()
+                              if "r2_mean" in s})
+        items.append(("Learnability — CV R² by model",
+                      C.ranked_bar(learn_r2, path("learn"), diverging=True,
+                                   title="5-fold CV R² by model", xlabel="CV R²")))
+        # Causal pipeline
+        items.append(("Causal pipeline",
+                      C.causal_diagram(causal["structure_present"], path("causal"),
+                                       message=causal["message"])))
+        # Latent radar + heatmap
+        contrib = lat["contribution"]
+        items.append(("Latent contribution (radar)",
+                      C.radar_chart(list(contrib.keys()), list(contrib.values()),
+                                    path("radar"), title="Latent contribution (MI share)")))
+        lat_corr = pd.concat(
+            [lat["latents"].reset_index(drop=True),
+             pd.to_numeric(df[cfg.target], errors="coerce").reset_index(drop=True)], axis=1)
+        items.append(("Latent variables vs target",
+                      C.correlation_heatmap(lat_corr, path("lat_corr"),
+                                            title="Latent vs target")))
+        # Target analysis
+        items.append(("Target distribution",
+                      C.target_distribution(tgt.get("values", []), path("target"),
+                                            target_name=cfg.target, stats=tgt)))
+        # PCA scree + biplot
+        items.append(("PCA explained variance (scree)",
+                      C.explained_variance(pca["explained_variance_ratio"], path("scree"))))
+        material = df["Material"] if "Material" in df.columns else None
+        items.append(("PCA biplot",
+                      C.biplot(pca["scores"], pca["loadings"], path("biplot"),
+                               color_series=material, color_name="Material")))
+        items.append(("PCA loadings (PC1)",
+                      C.pca_loading_bar(pca["loadings"], path("load"), pc="PC1")))
+
+        # ---- AI Research Assistant + conclusion ----
+        insights = intelligence.ai_insights(summary, pred, redund, diff, learn,
+                                            causal, lat, tgt)
+        conclusion = intelligence.final_conclusion(summary, pred, learn, causal, tgt)
+
+        STATE.intel_results = {"summary": summary, "pred": pred, "redund": redund,
+                               "diff": diff, "learn": learn, "causal": causal,
+                               "latent": lat, "target": tgt, "pca": pca, "cfg": cfg}
+        STATE.intel_chart_items = items
+        STATE.intel_insights = insights
+        STATE.intel_conclusion = conclusion
+        STATE.intel_status = (f"Done. Difficulty: {diff['label']} · best CV R²="
+                              f"{learn['best_r2']:.3f}. See findings below.")
+    except Exception as e:  # noqa: BLE001
+        STATE.intel_error = f"{type(e).__name__}: {e}"
+        STATE.intel_status = "Dataset Intelligence failed."
+    finally:
+        STATE.is_intel_running = False
+
+
+def intel_export_pdf():
+    """One-click PDF report (Section 10)."""
+    r = STATE.intel_results
+    if not r:
+        STATE.intel_status = "Run the analysis first."
+        return
+    try:
+        out = intelligence.build_pdf_report(
+            "intelligence_report.pdf", r["summary"], r["pred"], r["diff"],
+            r["learn"], STATE.intel_conclusion, STATE.intel_insights,
+            STATE.intel_chart_items)
+        STATE.intel_status = f"Saved {out}."
+    except Exception as e:  # noqa: BLE001
+        STATE.intel_error = f"PDF export failed: {e}"
+
+
+# =============================================================================
 # PREDICTION HELPERS  (shared by single + batch)
 # =============================================================================
 def build_matrix(X_raw):
@@ -1338,12 +1710,7 @@ def draw_train_tab():
 
     imgui.dummy(imgui.ImVec2(0, 6))
     imgui.text("3) Train")
-    imgui.set_next_item_width(360)
-    changed, pct = imgui.slider_int("Test split %", int(round(STATE.test_size * 100)), 5, 50)
-    if changed:
-        STATE.test_size = pct / 100.0
-    imgui.same_line()
-    imgui.text_colored(DIM, f"({100 - pct}% train / {pct}% test)")
+    imgui.text_colored(DIM, "Evaluated with 5-fold cross-validation (stable on small data).")
     # Guard clicks while a run is in progress.
     if imgui.button("Train model", size=imgui.ImVec2(140, 0)):
         start_training()
@@ -1365,22 +1732,22 @@ def draw_train_tab():
         imgui.text_colored(GREEN, STATE.summary)
 
         imgui.dummy(imgui.ImVec2(0, 4))
-        imgui.text("Per-target performance (train vs held-out test)")
+        imgui.text("Per-target performance (in-sample train vs 5-fold CV)")
         flags = imgui.TableFlags_.borders | imgui.TableFlags_.row_bg
         if imgui.begin_table("metrics", 5, flags):
-            for h in ("Target", "Train R2", "Train RMSE", "Test R2", "Test RMSE"):
+            for h in ("Target", "Train R2", "Train RMSE", "CV R2", "CV RMSE"):
                 imgui.table_setup_column(h)
             imgui.table_headers_row()
-            for name, tr_r2, tr_rmse, te_r2, te_rmse in STATE.metrics:
+            for name, tr_r2, tr_rmse, cv_r2, cv_rmse in STATE.metrics:
                 imgui.table_next_row()
                 imgui.table_next_column(); imgui.text(name)
                 imgui.table_next_column(); imgui.text(f"{tr_r2:.4f}")
                 imgui.table_next_column(); imgui.text(f"{tr_rmse:.4f}")
-                # Colour test R2 by quality; a big train-test gap shows here.
+                # Colour CV R2 by quality; a big train-vs-CV gap flags overfitting.
                 imgui.table_next_column()
-                imgui.text_colored(GREEN if te_r2 >= 0.5 else (RED if te_r2 < 0 else DIM),
-                                   f"{te_r2:.4f}")
-                imgui.table_next_column(); imgui.text(f"{te_rmse:.4f}")
+                imgui.text_colored(GREEN if cv_r2 >= 0.5 else (RED if cv_r2 < 0 else DIM),
+                                   f"{cv_r2:.4f}")
+                imgui.table_next_column(); imgui.text(f"{cv_rmse:.4f}")
             imgui.end_table()
 
         imgui.dummy(imgui.ImVec2(0, 4))
@@ -1826,6 +2193,293 @@ def draw_charts_tab():
         imgui.end_child()
 
 
+def draw_latent_tab():
+    imgui.text("Latent Variables — engineered indices + learned PCA/PLS components")
+    imgui.text_wrapped(
+        "Builds interpretable engineered indices and learned latent variables, then "
+        "compares three leakage-safe pipelines (original / latent / both) with 5-fold "
+        "CV. All preprocessing is fit inside each fold. Uses the file & tab from the "
+        "Train tab.")
+    imgui.separator()
+
+    if not STATE.data_path:
+        imgui.text_colored(DIM, "Choose a spreadsheet in the Train tab first.")
+        return
+    imgui.text_colored(DIM, STATE.data_path)
+
+    if len(STATE.sheet_names) > 1:
+        imgui.set_next_item_width(360)
+        STATE.sheet_idx = min(STATE.sheet_idx, len(STATE.sheet_names) - 1)
+        changed, STATE.sheet_idx = imgui.combo("Sheet / tab", STATE.sheet_idx, STATE.sheet_names)
+        if changed:
+            STATE.lat_columns = []  # force a rescan for the new tab
+
+    if imgui.button("Scan columns", size=imgui.ImVec2(130, 0)):
+        lat_scan_columns()
+    imgui.same_line()
+    if imgui.small_button("Reset to recommended defaults"):
+        STATE.lat_categorical = ", ".join(latent.DEFAULT_CATEGORICAL)
+        STATE.lat_numerical = ", ".join(latent.DEFAULT_NUMERICAL)
+        if STATE.lat_columns:
+            tgt = (STATE.lat_columns[STATE.lat_target_idx]
+                   if 0 <= STATE.lat_target_idx < len(STATE.lat_columns) else "")
+            STATE.lat_excluded = ", ".join(latent.default_excluded(tgt, STATE.lat_columns))
+
+    if not STATE.lat_columns:
+        imgui.text_colored(DIM, STATE.lat_status)
+        return
+
+    # --- Selectors ---
+    imgui.set_next_item_width(360)
+    STATE.lat_target_idx = min(STATE.lat_target_idx, len(STATE.lat_columns) - 1)
+    _, STATE.lat_target_idx = imgui.combo("Target column", STATE.lat_target_idx, STATE.lat_columns)
+    imgui.set_next_item_width(520)
+    _, STATE.lat_categorical = imgui.input_text("Categorical features", STATE.lat_categorical)
+    imgui.set_next_item_width(520)
+    _, STATE.lat_numerical = imgui.input_text("Numerical features", STATE.lat_numerical)
+    imgui.set_next_item_width(520)
+    _, STATE.lat_excluded = imgui.input_text("Excluded / ID columns", STATE.lat_excluded)
+
+    # --- Engineered-index options ---
+    imgui.separator()
+    imgui.text("Engineered index options")
+    imgui.set_next_item_width(300)
+    _, STATE.lat_chem_w = imgui.input_float3("Chemical weights (pretreat, post, additive)",
+                                             STATE.lat_chem_w)
+    _, STATE.lat_biomass_pca = imgui.checkbox("Biomass index uses PCA-1 (else equal-weight mean)",
+                                              STATE.lat_biomass_pca)
+
+    # --- Component counts ---
+    imgui.set_next_item_width(300)
+    _, STATE.lat_pca_components = imgui.slider_int("PCA components", STATE.lat_pca_components, 2, 10)
+    imgui.set_next_item_width(300)
+    _, STATE.lat_pls_components = imgui.slider_int("PLS components", STATE.lat_pls_components, 1, 10)
+
+    imgui.dummy(imgui.ImVec2(0, 4))
+    if imgui.button("Run analysis", size=imgui.ImVec2(200, 0)):
+        start_latent()
+    imgui.text_colored(RED if STATE.lat_error else DIM, STATE.lat_status)
+    if STATE.lat_error:
+        imgui.text_wrapped(STATE.lat_error)
+
+    # --- Formulas (requirement 7: display formulas) ---
+    if imgui.collapsing_header("Engineered index formulas"):
+        for name in latent.ENGINEERED_INDEX_NAMES:
+            imgui.text_colored(GREEN, name)
+            imgui.text_wrapped("   " + latent.ENGINEERED_FORMULAS[name])
+
+    # --- PLS metrics ---
+    if STATE.lat_pls_result:
+        p = STATE.lat_pls_result
+        imgui.separator()
+        imgui.text(f"PLS (k={p['n_components']}, 5-fold CV):  "
+                   f"R²={p['r2_mean']:.3f}±{p['r2_std']:.3f}   "
+                   f"RMSE={p['rmse_mean']:.3f}±{p['rmse_std']:.3f}   "
+                   f"MAE={p['mae_mean']:.3f}±{p['mae_std']:.3f}")
+
+    # --- Comparison table ---
+    if STATE.lat_compare_result:
+        _draw_comparison_table(STATE.lat_compare_result)
+
+    # --- Export buttons ---
+    if STATE.lat_last:
+        imgui.dummy(imgui.ImVec2(0, 4))
+        imgui.text("Export:")
+        imgui.same_line()
+        if imgui.small_button("rows+latents .xlsx"):
+            lat_export("xlsx")
+        imgui.same_line()
+        if imgui.small_button("PCA loadings .csv"):
+            lat_export("loadings")
+        imgui.same_line()
+        if imgui.small_button("CV comparison .csv"):
+            lat_export("comparison")
+        imgui.same_line()
+        if imgui.small_button("pipeline .joblib"):
+            lat_export("pipeline")
+
+    # --- Charts ---
+    if STATE.lat_chart_items:
+        imgui.separator()
+        if imgui.begin_child("lat_charts", imgui.ImVec2(0, 0)):
+            for title, rel in STATE.lat_chart_items:
+                imgui.text_colored(GREEN, title)
+                _show_chart_image(rel)
+                imgui.dummy(imgui.ImVec2(0, 8))
+        imgui.end_child()
+
+
+def _draw_comparison_table(comp):
+    """Render the A/B/C x model CV results as a table."""
+    imgui.dummy(imgui.ImVec2(0, 4))
+    imgui.text("Pipeline comparison (mean ± std, 5-fold CV)")
+    flags = imgui.TableFlags_.borders | imgui.TableFlags_.row_bg
+    if imgui.begin_table("latcmp", 5, flags):
+        for h in ("Pipeline", "Model", "R2", "RMSE", "MAE"):
+            imgui.table_setup_column(h)
+        imgui.table_headers_row()
+        labels = {"A": "A: original", "B": "B: latent", "C": "C: both"}
+        for v in ("A", "B", "C"):
+            for m, sc in comp.get(v, {}).items():
+                imgui.table_next_row()
+                imgui.table_next_column(); imgui.text(labels[v])
+                imgui.table_next_column(); imgui.text(m)
+                if "error" in sc:
+                    imgui.table_next_column(); imgui.text_colored(RED, "error")
+                    imgui.table_next_column(); imgui.text("-")
+                    imgui.table_next_column(); imgui.text("-")
+                    continue
+                imgui.table_next_column()
+                imgui.text_colored(GREEN if sc["r2_mean"] >= 0.5 else DIM,
+                                   f"{sc['r2_mean']:.3f}±{sc['r2_std']:.3f}")
+                imgui.table_next_column(); imgui.text(f"{sc['rmse_mean']:.2f}±{sc['rmse_std']:.2f}")
+                imgui.table_next_column(); imgui.text(f"{sc['mae_mean']:.2f}±{sc['mae_std']:.2f}")
+        imgui.end_table()
+
+
+def draw_intelligence_tab():
+    imgui.text("Dataset Intelligence — can this dataset predict the target, and why / why not?")
+    imgui.text_wrapped(
+        "Reuses your Train / Column types selections (file, tab, target, features, "
+        "exclusions). Evaluates predictability, redundancy, difficulty, learnability, "
+        "causal structure, latent contribution, target shape and PCA — then explains "
+        "the result in plain language. Runs in the background.")
+    imgui.separator()
+
+    if not STATE.data_path:
+        imgui.text_colored(DIM, "Choose a spreadsheet in the Train tab first.")
+        return
+    imgui.text_colored(DIM, STATE.data_path
+                       + (f"  ·  tab: {_current_sheet()}" if _current_sheet() else ""))
+
+    targets = _configured_targets()
+    if not targets:
+        imgui.text_colored(RED, "No target configured. Set one in the Train / Column types tab.")
+        return
+    imgui.set_next_item_width(360)
+    STATE.intel_target_idx = min(STATE.intel_target_idx, len(targets) - 1)
+    _, STATE.intel_target_idx = imgui.combo("Target to analyse", STATE.intel_target_idx, targets)
+    imgui.set_next_item_width(300)
+    _, STATE.intel_pca_components = imgui.slider_int("PCA components", STATE.intel_pca_components, 2, 10)
+
+    imgui.dummy(imgui.ImVec2(0, 4))
+    if imgui.button("Run analysis", size=imgui.ImVec2(200, 0)):
+        start_intelligence()
+    if STATE.intel_results:
+        imgui.same_line()
+        if imgui.button("Export PDF report", size=imgui.ImVec2(180, 0)):
+            intel_export_pdf()
+    imgui.text_colored(RED if STATE.intel_error else DIM, STATE.intel_status)
+    if STATE.intel_error:
+        imgui.text_wrapped(STATE.intel_error)
+
+    r = STATE.intel_results
+    if not r:
+        return
+
+    # ---- AI Research Assistant panel ----
+    if STATE.intel_insights and imgui.collapsing_header("AI Research Assistant",
+                                                        imgui.TreeNodeFlags_.default_open):
+        for line in STATE.intel_insights:
+            imgui.bullet()
+            imgui.same_line()
+            imgui.text_wrapped(line)
+
+    # ---- Section 1: summary ----
+    if imgui.collapsing_header("1 · Dataset summary", imgui.TreeNodeFlags_.default_open):
+        s = r["summary"]
+        _kv_table("intel_sum", [
+            ("Samples", str(s["n_samples"])),
+            ("Features", f"{s['n_features']} ({s['n_numerical']} num, {s['n_categorical']} cat)"),
+            ("Missing overall", f"{s['missing_pct_overall']}%"),
+            ("Duplicate rows", str(s["duplicate_rows"])),
+            ("Duplicate conditions", str(s["duplicate_conditions"])),
+            ("Target std", f"{s['target_std']:.4g}"),
+            ("Target range", f"{s['target_min']:.4g} – {s['target_max']:.4g}"),
+        ])
+
+    # ---- Section 4: difficulty ----
+    if imgui.collapsing_header("4 · Prediction difficulty", imgui.TreeNodeFlags_.default_open):
+        d = r["diff"]
+        color = {"Easy": GREEN, "Moderate": (0.9, 0.7, 0.2, 1.0),
+                 "Hard": (0.95, 0.5, 0.2, 1.0), "Very Hard": RED}.get(d["label"], DIM)
+        imgui.text_colored(color, f"Difficulty: {d['label']}   "
+                           f"(estimated achievable CV R²  {d['est_r2_low']:.2f}–{d['est_r2_high']:.2f})")
+        imgui.text_wrapped(d["explanation"])
+
+    # ---- Section 5: learnability ----
+    if imgui.collapsing_header("5 · Learnability (5-fold CV)"):
+        _draw_learnability_table(r["learn"])
+
+    # ---- Section 3: redundancy ----
+    if imgui.collapsing_header("3 · Feature redundancy"):
+        red = r["redund"]
+        if red["suggest_remove"]:
+            imgui.text_wrapped("Suggested to drop: " + ", ".join(red["suggest_remove"][:20]))
+        if red["high_corr_pairs"]:
+            imgui.text_wrapped("Highly correlated pairs: "
+                               + ", ".join(f"{a}~{b} ({r_:.2f})"
+                                           for a, b, r_ in red["high_corr_pairs"][:8]))
+        if red["near_zero_variance"]:
+            imgui.text_colored(DIM, "Near-zero variance: " + ", ".join(red["near_zero_variance"]))
+
+    # ---- Final conclusion ----
+    if imgui.collapsing_header("Final conclusion", imgui.TreeNodeFlags_.default_open):
+        imgui.text_wrapped(STATE.intel_conclusion)
+
+    # ---- Charts ----
+    if STATE.intel_chart_items:
+        imgui.separator()
+        if imgui.begin_child("intel_charts", imgui.ImVec2(0, 0)):
+            for title, rel in STATE.intel_chart_items:
+                imgui.text_colored(GREEN, title)
+                _show_chart_image(rel)
+                imgui.dummy(imgui.ImVec2(0, 8))
+        imgui.end_child()
+
+
+def _kv_table(tid, rows):
+    """Render a two-column key/value table."""
+    flags = imgui.TableFlags_.borders | imgui.TableFlags_.row_bg
+    if imgui.begin_table(tid, 2, flags):
+        imgui.table_setup_column("Metric")
+        imgui.table_setup_column("Value")
+        imgui.table_headers_row()
+        for k, v in rows:
+            imgui.table_next_row()
+            imgui.table_next_column(); imgui.text(k)
+            imgui.table_next_column(); imgui.text(v)
+        imgui.end_table()
+
+
+def _draw_learnability_table(learn):
+    """CV metrics per model, with the insufficiency warning."""
+    flags = imgui.TableFlags_.borders | imgui.TableFlags_.row_bg
+    if imgui.begin_table("intel_learn", 5, flags):
+        for h in ("Model", "R2", "RMSE", "MAE", "kind"):
+            imgui.table_setup_column(h)
+        imgui.table_headers_row()
+        for name, sc in learn["results"].items():
+            imgui.table_next_row()
+            imgui.table_next_column(); imgui.text(name)
+            if "error" in sc:
+                imgui.table_next_column(); imgui.text_colored(RED, "error")
+                imgui.table_next_column(); imgui.text("-")
+                imgui.table_next_column(); imgui.text("-")
+                imgui.table_next_column(); imgui.text(sc.get("kind", ""))
+                continue
+            imgui.table_next_column()
+            imgui.text_colored(GREEN if sc["r2_mean"] >= 0.3 else RED,
+                               f"{sc['r2_mean']:.3f}±{sc['r2_std']:.3f}")
+            imgui.table_next_column(); imgui.text(f"{sc['rmse_mean']:.2f}")
+            imgui.table_next_column(); imgui.text(f"{sc['mae_mean']:.2f}")
+            imgui.table_next_column(); imgui.text(sc.get("kind", ""))
+        imgui.end_table()
+    if learn.get("insufficient"):
+        imgui.text_colored(RED, "This dataset may not contain enough predictive "
+                           "information for the selected target.")
+
+
 def gui():
     """Top-level GUI callback — called every frame by imgui-bundle."""
     imgui.text("🌲 ExtraTrees Multi-Target Trainer & Predictor")
@@ -1860,6 +2514,12 @@ def gui():
             imgui.end_tab_item()
         if imgui.begin_tab_item("Charts")[0]:
             draw_charts_tab()
+            imgui.end_tab_item()
+        if imgui.begin_tab_item("Latent Variables")[0]:
+            draw_latent_tab()
+            imgui.end_tab_item()
+        if imgui.begin_tab_item("Dataset Intelligence")[0]:
+            draw_intelligence_tab()
             imgui.end_tab_item()
         imgui.end_tab_bar()
 
