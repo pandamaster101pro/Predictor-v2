@@ -97,6 +97,7 @@ import latent
 import intelligence
 import screening
 import report
+import units
 
 MODEL_OUT = "model.joblib"
 RANDOM_STATE = 42
@@ -403,6 +404,14 @@ def build_Xy(cfg, notes=None):
 
     df = read_any(cfg["data_path"], sheet=cfg.get("sheet"))
     df = prepare_raw(df, cfg["ids"], cfg["mixed"])
+    # Standardize measurement units per column BEFORE numeric coercion, so cells
+    # like "2 h" become 120 (minutes) and a "(K)" temperature column becomes °C.
+    # Targets (labels) and manually-typed columns are protected from conversion.
+    df = units.standardize_units(
+        df,
+        protected=set(cfg["targets"]) | set(cfg.get("col_types", {}).keys()),
+        notes=notes,
+    )
     # Auto-fix columns that are numeric except for a stray text marker, so a real
     # temperature/time column isn't mistaken for a categorical. Manual choices win.
     df = auto_coerce_numeric(df, protected=set(cfg.get("col_types", {}).keys()))
