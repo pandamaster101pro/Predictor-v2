@@ -13,7 +13,6 @@ from __future__ import annotations
 import os
 import tempfile
 
-import numpy as np
 import pandas as pd
 
 import charts as C
@@ -54,7 +53,6 @@ def _interval_png(result, screener, path):
 
     t = result["target"]
     pred = result["prediction"]
-    rank = result["recommendation"]["ranking"]
     fig, ax = plt.subplots(figsize=(6.6, 1.9), dpi=130)
     col = screener.y_train[t].values
     ax.hist(col, bins=25, color="#c9d8e8", edgecolor="#9bb")

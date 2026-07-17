@@ -424,7 +424,7 @@ def feature_importance(importances, out, top=15, measured=None,
             colors.append(AQUA)
         else:
             colors.append(BLUE)
-    bars = ax.barh(range(len(draw)), draw.values, color=colors, height=0.72)
+    ax.barh(range(len(draw)), draw.values, color=colors, height=0.72)
     ax.set_yticks(range(len(draw)))
     ax.set_yticklabels([short(label(f), 34) for f in draw.index], fontsize=8)
     ax.set_title(title, fontsize=12, loc="left", fontweight="bold")
@@ -592,7 +592,6 @@ def shap_summary(estimator, X_df, out, target_name="", max_display=15):
                             "Install the 'shap' package to enable SHAP charts.")
     try:
         sv, Xs = _shap_values_for(estimator, X_df)
-        import shap
         fig = plt.figure(facecolor=SURF)
         shap.summary_plot(sv, Xs, max_display=max_display, show=False,
                           plot_size=(9, max(4, 0.4 * min(max_display, X_df.shape[1]) + 2)))

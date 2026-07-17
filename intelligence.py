@@ -557,7 +557,7 @@ def final_conclusion(summary: dict, pred: dict, learn: dict, causal: dict,
     n = summary["n_samples"]
     n_num = summary["n_numerical"]
     max_corr = pred["max_pearson"]
-    best_name, best_r2 = None, learn.get("best_r2", float("nan"))
+    best_r2 = learn.get("best_r2", float("nan"))
     parts = [
         f"The current dataset contains {n} usable samples and {n_num} numerical features.",
         f"The strongest correlation with {summary['target']} is only {max_corr:.2f}.",
