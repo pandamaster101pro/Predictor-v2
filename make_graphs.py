@@ -12,7 +12,7 @@ Produces one dashboard PNG that shows, for the reversible-capacity dataset:
 Run:  python make_graphs.py      ->  writes capacity_connections.png
 """
 
-import sys, subprocess, importlib.util
+import sys, importlib.util
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -20,16 +20,19 @@ except Exception:
     pass
 
 
-def auto_bootstrap():
+def check_dependencies():
+    """Offline — never installs anything; exit if a required package is missing."""
     deps = {"pandas": "pandas", "numpy": "numpy", "sklearn": "scikit-learn",
             "xgboost": "xgboost", "matplotlib": "matplotlib", "openpyxl": "openpyxl"}
     miss = [p for m, p in deps.items() if importlib.util.find_spec(m) is None]
     if miss:
-        print(f"[*] Installing {miss} …")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "--only-binary=:all:", *miss])
+        print("[X] Missing required packages: " + " ".join(miss))
+        print("    Runs fully offline; install them yourself, then re-run:")
+        print("        pip install " + " ".join(miss))
+        sys.exit(1)
 
 
-auto_bootstrap()
+check_dependencies()
 
 import numpy as np
 import pandas as pd

@@ -18,60 +18,62 @@ HOW TO RUN
 ----------
     pip install imgui-bundle pandas numpy scikit-learn openpyxl joblib
     python app_imgui.py
-    (Dependencies are also auto-installed on first run.)
+
+This app runs fully offline: it never installs packages or reaches the
+network. If a required package is missing it prints the pip command and
+exits, leaving it to you to install (from a mirror/wheelhouse if offline).
 
 The trained model can be saved to / loaded from 'model.joblib'.
 ==============================================================
 """
 
 import sys
-import subprocess
 import threading
+import importlib.util
 
 
 # -----------------------------------------------------------------------------
-# Auto-install missing dependencies BEFORE importing them.
+# Dependency check (offline — never installs anything or touches the network).
+# Required packages must be present to launch; optional ones only unlock extra
+# tabs (Compare models, Charts, PDF reports) and just produce a note.
 # -----------------------------------------------------------------------------
-def auto_bootstrap():
-    """Install any missing packages this script needs (wheels only)."""
-    dependencies = {
+def check_dependencies():
+    required = {
         "imgui_bundle": "imgui-bundle",
         "pandas": "pandas",
         "numpy": "numpy",
         "sklearn": "scikit-learn",
-        "openpyxl": "openpyxl",   # lets pandas read .xlsx files
+        "scipy": "scipy",          # differential evolution for the "Optimize" tab
         "joblib": "joblib",
-        # Gradient-boosting libraries for the "Compare models" tab.
-        "xgboost": "xgboost",
+        "openpyxl": "openpyxl",    # lets pandas read .xlsx files
+    }
+    optional = {
+        "matplotlib": "matplotlib",  # chart rendering for the "Charts" tab
+        "xgboost": "xgboost",        # extra algorithms for "Compare models"
         "lightgbm": "lightgbm",
         "catboost": "catboost",
-        "scipy": "scipy",         # differential evolution for the "Optimize" tab
-        "matplotlib": "matplotlib",  # chart rendering for the "Charts" tab
-        "shap": "shap",           # SHAP summary / dependence plots (Charts tab)
-        "reportlab": "reportlab",  # PDF screening reports
+        "shap": "shap",              # SHAP summary / dependence plots
+        "reportlab": "reportlab",    # PDF screening reports
     }
-    missing = []
-    for import_name, pip_name in dependencies.items():
-        try:
-            __import__(import_name)
-        except ImportError:
-            missing.append(pip_name)
-    if missing:
-        print(f"[!] Missing modules found: {missing}")
-        print("[*] Installing dependencies, please wait...")
-        try:
-            # --only-binary=:all: forces prebuilt wheels (imgui-bundle won't
-            # compile from source on Windows without a C++ toolchain).
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "--only-binary=:all:", *missing]
-            )
-            print("[OK] All packages installed successfully!\n" + "=" * 40)
-        except subprocess.CalledProcessError as e:
-            print(f"[X] Auto-installation failed: {e}")
-            sys.exit(1)
+
+    def absent(mods):
+        return [pip for mod, pip in mods.items()
+                if importlib.util.find_spec(mod) is None]
+
+    missing_opt = absent(optional)
+    if missing_opt:
+        print("[i] Optional packages not installed (their tabs stay disabled): "
+              + " ".join(missing_opt))
+    missing_req = absent(required)
+    if missing_req:
+        print("[X] Missing required packages: " + " ".join(missing_req))
+        print("    This app runs fully offline and will not install anything.")
+        print("    Install them yourself, then re-run:")
+        print("        pip install " + " ".join(missing_req + missing_opt))
+        sys.exit(1)
 
 
-auto_bootstrap()
+check_dependencies()
 
 import os
 import re
@@ -283,6 +285,34 @@ def _anon_names(index, total):
     return f"numeric_feature_A{s}", f"group_label_B{s}", f"text_modifier_C{s}"
 
 
+def _mixed_list(mixed):
+    """Normalize the messy-column setting to a clean ordered list."""
+    if isinstance(mixed, str):
+        return [c.strip() for c in mixed.split(",") if c.strip()]
+    return [str(c).strip() for c in (mixed or []) if str(c).strip()]
+
+
+def mixed_feature_labels(mixed, columns=None):
+    """
+    Human-readable labels for parsed messy-column features.
+
+    The model still uses stable internal names such as numeric_feature_A1, but
+    the UI should show the original column and the parsed part instead.
+    """
+    names = _mixed_list(mixed)
+    if columns is not None:
+        available = {str(c) for c in columns}
+        names = [c for c in names if c in available]
+    labels = {}
+    total = len(names)
+    for i, col in enumerate(names):
+        amount, code, modifier = _anon_names(i, total)
+        labels[amount] = f"{col}: number/percent"
+        labels[code] = f"{col}: code"
+        labels[modifier] = f"{col}: detail"
+    return labels
+
+
 def prepare_raw(df, ids, mixed):
     """
     Drop id columns and parse+drop every messy column into its own anonymized
@@ -290,9 +320,7 @@ def prepare_raw(df, ids, mixed):
     """
     df = df.drop(columns=ids, errors="ignore")
 
-    # Accept either a string (one column) or a list (several).
-    if isinstance(mixed, str):
-        mixed = [mixed] if mixed else []
+    mixed = _mixed_list(mixed)
     present = [c for c in mixed if c and c in df.columns]
     if not present:
         return df
@@ -543,24 +571,29 @@ def run_capacity_optimization(data_path, target, excluded, fixed, direction,
     """
     from xgboost import XGBRegressor
 
-    df = read_any(data_path, sheet=sheet)
+    raw_df = read_any(data_path, sheet=sheet)
+    label_map = mixed_feature_labels(mixed or [], columns=raw_df.columns)
+    generated_cols = set(label_map)
     # Drop id columns and split any messy columns into anonymized A/B/C features,
     # so the optimizer's knobs line up with the training pipeline.
-    df = prepare_raw(df, ids or [], mixed or [])
+    df = prepare_raw(raw_df, ids or [], mixed or [])
     if target not in df.columns:
         raise ValueError(f"Target '{target}' not in the file.")
     df[target] = pd.to_numeric(df[target], errors="coerce")
     df = df.dropna(subset=[target]).reset_index(drop=True)
 
     col_types = col_types or {}
-    generated = ("numeric_feature_", "group_label_", "text_modifier_")
-    if features:
+    # Let fixed knobs use either the internal id or the readable UI label.
+    by_label = {v: k for k, v in label_map.items()}
+    fixed = {by_label.get(k, k): v for k, v in (fixed or {}).items()}
+    column_type_mode = features is not None
+    if column_type_mode:
         # COLUMN-TYPE MODE: optimise only over role='Feature' columns (plus any
         # features generated from parsed messy columns). Targets / ids / excluded
         # / measured-outcome columns are automatically held out.
         feat_set = set(features)
         controllable = [c for c in df.columns
-                        if c != target and (c in feat_set or c.startswith(generated))]
+                        if c != target and (c in feat_set or c in generated_cols)]
     else:
         controllable = [c for c in df.columns if c not in (set(excluded) | {target})]
     if not controllable:
@@ -576,6 +609,10 @@ def run_capacity_optimization(data_path, target, excluded, fixed, direction,
     numeric_cols, cat_choices = [], {}
     for c in controllable:
         kind = col_types.get(c)
+        if c.startswith("numeric_feature_"):
+            kind = "numeric"
+        elif c.startswith("group_label_") or c.startswith("text_modifier_"):
+            kind = "categorical"
         is_num = (kind == "numeric") or (kind is None
                                          and pd.api.types.is_numeric_dtype(X_raw[c]))
         if is_num:
@@ -672,8 +709,9 @@ def run_capacity_optimization(data_path, target, excluded, fixed, direction,
     return dict(target=target, r2=cv_r2, predicted=predicted,
                 obs_min=float(y.min()), obs_max=float(y.max()),
                 recipe=ordered, fixed=set(fixed), edges=edges,
+                labels=label_map,
                 n_rows=len(df), n_knobs=len(controllable),
-                mode=("column-type" if features else "manual"),
+                mode=("column-type" if column_type_mode else "manual"),
                 n_numeric=len(numeric_cols), n_categorical=len(cat_choices))
 
 
@@ -1241,23 +1279,34 @@ def start_optimize():
     # optimizer from the per-column roles/types instead of a hand-typed exclusion
     # list — role='Feature' columns become the knobs, the chosen role='Target'
     # is the objective, and everything else is held out automatically.
-    features = col_types = None
+    features = col_types = ids = mixed = None
+    excluded = _split_cols(STATE.opt_excluded)
     if STATE.coltype_columns:
+        sync_roles_to_cfg()
         features = [c for c in STATE.coltype_columns
                     if STATE.coltype_role.get(c) == "feature"]
+        ids = [c for c in STATE.coltype_columns
+               if STATE.coltype_role.get(c) == "id"]
+        mixed = [c for c in STATE.coltype_columns
+                 if STATE.coltype_role.get(c) == "messy"]
+        excluded = [c for c in STATE.coltype_columns
+                    if STATE.coltype_role.get(c) == "exclude"]
         col_types = dict(STATE.coltype_map)
+    else:
+        ids = _split_cols(STATE.id_columns)
+        mixed = _split_cols(STATE.mixed_column)
 
     cfg = dict(
         data_path=STATE.data_path,
         target=STATE.opt_target.strip(),
-        excluded=_split_cols(STATE.opt_excluded),
+        excluded=excluded,
         fixed=_parse_fixed(STATE.opt_fixed),
         direction="maximise" if STATE.opt_direction_idx == 0 else "minimise",
         sheet=_current_sheet(),                  # selected worksheet/tab
         features=features,
         col_types=col_types,
-        ids=_split_cols(STATE.id_columns),
-        mixed=_split_cols(STATE.mixed_column),
+        ids=ids,
+        mixed=mixed,
     )
     threading.Thread(target=_optimize_worker, args=(cfg,), daemon=True).start()
 
@@ -2547,13 +2596,14 @@ def draw_optimize_tab():
     role = STATE.coltype_role
     has_roles = bool(STATE.coltype_columns)
     feats = [c for c in STATE.coltype_columns if role.get(c) == "feature"] if has_roles else []
+    messy = [c for c in STATE.coltype_columns if role.get(c) == "messy"] if has_roles else []
     tgts = [c for c in STATE.coltype_columns if role.get(c) == "target"] if has_roles else []
     held = [c for c in STATE.coltype_columns
-            if role.get(c) in ("target", "id", "exclude", "messy")] if has_roles else []
+            if role.get(c) in ("target", "id", "exclude")] if has_roles else []
 
     if has_roles:
-        imgui.text_colored(GREEN, f"Using Column-types roles: {len(feats)} feature knob(s) "
-                           f"to optimize.")
+        imgui.text_colored(GREEN, f"Using Column-types roles: {len(feats)} feature column(s) "
+                           f"+ {len(messy)} parsed messy column(s) as knobs.")
         imgui.text_colored(DIM, f"Automatically held out ({len(held)}): "
                            + ", ".join(held[:12]) + (" …" if len(held) > 12 else ""))
         # Target: pick from the columns tagged 'Target'.
@@ -2574,6 +2624,8 @@ def draw_optimize_tab():
         imgui.text_colored(ORANGE, "No Column-types roles set — using the manual exclusion "
                            "list below. Configure the Column types tab for automatic "
                            "knob selection.")
+        if imgui.small_button("Scan Column types now"):
+            scan_column_types()
         imgui.set_next_item_width(360)
         _, STATE.opt_target = imgui.input_text("Target to optimise", STATE.opt_target)
 
@@ -2581,7 +2633,7 @@ def draw_optimize_tab():
     _, STATE.opt_direction_idx = imgui.combo("Direction", STATE.opt_direction_idx,
                                              ["maximise", "minimise"])
     imgui.set_next_item_width(360)
-    _, STATE.opt_fixed = imgui.input_text("Fixed knobs (col=value, comma-sep)", STATE.opt_fixed)
+    _, STATE.opt_fixed = imgui.input_text("Fixed knobs (name=value, comma-sep)", STATE.opt_fixed)
 
     # The manual exclusion list is only used as a fallback (no roles configured).
     if not has_roles:
@@ -2601,6 +2653,10 @@ def draw_optimize_tab():
 
     r = STATE.opt_result
     if r is not None:
+        labels = r.get("labels", {})
+        def knob_label(name):
+            return labels.get(name, name)
+
         imgui.separator()
         verdict = GREEN if r["predicted"] <= r["obs_max"] * 1.05 else (0.9, 0.7, 0.2, 1.0)
         imgui.text_colored(verdict,
@@ -2609,7 +2665,8 @@ def draw_optimize_tab():
         imgui.text_colored(DIM, f"Model 5-fold R² = {r['r2']:.2f} — treat as a hypothesis to test.")
         if r["edges"]:
             imgui.text_colored((0.9, 0.7, 0.2, 1.0),
-                               "Extrapolation risk (knob at edge of data): " + ", ".join(r["edges"]))
+                               "Extrapolation risk (knob at edge of data): "
+                               + ", ".join(knob_label(e) for e in r["edges"]))
 
         imgui.dummy(imgui.ImVec2(0, 4))
         imgui.text("Recommended conditions")
@@ -2619,12 +2676,13 @@ def draw_optimize_tab():
             imgui.table_setup_column("Value")
             imgui.table_headers_row()
             for name, val in r["recipe"]:
+                shown = knob_label(name)
                 imgui.table_next_row()
                 imgui.table_next_column()
                 if name in r["fixed"]:
-                    imgui.text_colored(DIM, name + "  (fixed)")
+                    imgui.text_colored(DIM, shown + "  (fixed)")
                 else:
-                    imgui.text(name)
+                    imgui.text(shown)
                 imgui.table_next_column()
                 imgui.text(f"{val:g}" if isinstance(val, float) else str(val))
             imgui.end_table()

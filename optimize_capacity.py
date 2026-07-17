@@ -14,11 +14,11 @@ HOW TO RUN
 ----------
     pip install pandas numpy scikit-learn xgboost scipy openpyxl
     python optimize_capacity.py
-    (dependencies auto-install on first run)
+    (runs fully offline; install the packages above yourself first)
 ==================================================================================
 """
 
-import sys, subprocess, importlib.util
+import sys, importlib.util
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -26,16 +26,19 @@ except Exception:
     pass
 
 
-def auto_bootstrap():
+def check_dependencies():
+    """Offline — never installs anything; exit if a required package is missing."""
     deps = {"pandas": "pandas", "numpy": "numpy", "sklearn": "scikit-learn",
             "xgboost": "xgboost", "scipy": "scipy", "openpyxl": "openpyxl"}
     missing = [p for m, p in deps.items() if importlib.util.find_spec(m) is None]
     if missing:
-        print(f"[*] Installing {missing} …")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "--only-binary=:all:", *missing])
+        print("[X] Missing required packages: " + " ".join(missing))
+        print("    Runs fully offline; install them yourself, then re-run:")
+        print("        pip install " + " ".join(missing))
+        sys.exit(1)
 
 
-auto_bootstrap()
+check_dependencies()
 
 import numpy as np
 import pandas as pd

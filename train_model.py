@@ -25,12 +25,12 @@ HOW TO RUN
     pip install pandas numpy scikit-learn openpyxl
     python train_model.py --data path/to/your_spreadsheet.xlsx
 
-  (Dependencies are also auto-installed on first run.)
+  (Runs fully offline; install the packages above yourself first.)
 =============================================================================
 """
 
 import sys
-import subprocess
+import importlib.util
 import argparse
 
 # Force UTF-8 output so prints never crash on non-UTF-8 consoles (e.g. Windows GBK).
@@ -41,36 +41,26 @@ except Exception:
 
 
 # -----------------------------------------------------------------------------
-# Auto-install missing dependencies before importing them.
+# Dependency check (offline — never installs anything or touches the network).
 # -----------------------------------------------------------------------------
-def auto_bootstrap():
-    """Install any missing packages this script needs."""
+def check_dependencies():
+    """Exit with a clear message if any required package is missing."""
     dependencies = {
         "pandas": "pandas",
         "numpy": "numpy",
         "sklearn": "scikit-learn",
         "openpyxl": "openpyxl",   # needed by pandas to read .xlsx files
     }
-    missing = []
-    for import_name, pip_name in dependencies.items():
-        try:
-            __import__(import_name)
-        except ImportError:
-            missing.append(pip_name)
+    missing = [pip for mod, pip in dependencies.items()
+               if importlib.util.find_spec(mod) is None]
     if missing:
-        print(f"[!] Missing modules found: {missing}")
-        print("[*] Installing dependencies, please wait...")
-        try:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "--only-binary=:all:", *missing]
-            )
-            print("[OK] All packages installed successfully!\n" + "=" * 40)
-        except subprocess.CalledProcessError as e:
-            print(f"[X] Auto-installation failed: {e}")
-            sys.exit(1)
+        print("[X] Missing required packages: " + " ".join(missing))
+        print("    This script runs fully offline; install them yourself, then re-run:")
+        print("        pip install " + " ".join(missing))
+        sys.exit(1)
 
 
-auto_bootstrap()
+check_dependencies()
 
 import re
 import numpy as np
