@@ -35,7 +35,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import KFold, cross_validate, cross_val_predict
 from sklearn.pipeline import FeatureUnion, Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, StandardScaler
 
 RANDOM_STATE = 42
 
@@ -250,12 +250,25 @@ def _onehot() -> OneHotEncoder:
         return OneHotEncoder(handle_unknown="ignore", sparse=False)
 
 
+def _as_str_array(a):
+    """Cast every cell to str so OneHotEncoder never sees a mixed int/str column.
+
+    A messy column can hold both numbers and text (e.g. 900 and 'Ar'); the
+    encoder rejects that ("input must be uniformly strings or numbers"). Runs
+    AFTER imputation, so there are no NaNs left to turn into the string 'nan'.
+    Module-level (not a lambda) so the pipeline stays picklable under n_jobs.
+    """
+    return np.asarray(a, dtype=object).astype(str)
+
+
 def make_tree_preprocessor(categorical: list[str], numerical: list[str]) -> ColumnTransformer:
     """Impute (median / 'Missing') + one-hot. No scaling — trees don't need it."""
     return ColumnTransformer([
         ("num", SimpleImputer(strategy="median"), numerical),
         ("cat", Pipeline([
             ("impute", SimpleImputer(strategy="constant", fill_value="Missing")),
+            ("tostr", FunctionTransformer(_as_str_array,
+                                          feature_names_out="one-to-one")),
             ("onehot", _onehot()),
         ]), categorical),
     ], remainder="drop")

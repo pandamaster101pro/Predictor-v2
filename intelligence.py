@@ -151,8 +151,11 @@ def predictability(df: pd.DataFrame, config: L.LatentConfig) -> dict:
     rows = []
     for feat in num:
         x_ser = pd.to_numeric(df[feat], errors="coerce")[mask]
-        x = x_ser.fillna(x_ser.median()).to_numpy(dtype=float)
-        if np.std(x) == 0:
+        med = x_ser.median()
+        x = x_ser.fillna(0.0 if pd.isna(med) else med).to_numpy(dtype=float)
+        # A column that is empty (all-NaN) for the target rows, or constant,
+        # carries no signal — score it 0 instead of feeding NaN to sklearn.
+        if not np.isfinite(x).all() or np.std(x) == 0:
             pear = spear = mi = dcor = 0.0
         else:
             pear = abs(float(np.corrcoef(x, y)[0, 1]))
@@ -431,7 +434,12 @@ def latent_analysis(df: pd.DataFrame, config: L.LatentConfig) -> dict:
     corr, mi = {}, {}
     for col in eng.columns:
         x = E[col].to_numpy(dtype=float)
-        corr[col] = 0.0 if np.std(x) == 0 else float(np.corrcoef(x, y)[0, 1])
+        if not np.isfinite(x).all():          # never feed NaN/inf to sklearn
+            x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        if np.std(x) == 0:
+            corr[col], mi[col] = 0.0, 0.0
+            continue
+        corr[col] = float(np.corrcoef(x, y)[0, 1])
         mi[col] = float(mutual_info_regression(x.reshape(-1, 1), y,
                                                random_state=RANDOM_STATE)[0])
 

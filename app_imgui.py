@@ -48,6 +48,7 @@ def auto_bootstrap():
         "scipy": "scipy",         # differential evolution for the "Optimize" tab
         "matplotlib": "matplotlib",  # chart rendering for the "Charts" tab
         "shap": "shap",           # SHAP summary / dependence plots (Charts tab)
+        "reportlab": "reportlab",  # PDF screening reports
     }
     missing = []
     for import_name, pip_name in dependencies.items():
@@ -92,14 +93,65 @@ from sklearn.metrics import r2_score, mean_squared_error
 from imgui_bundle import imgui, immapp, hello_imgui, portable_file_dialogs as pfd
 import latent
 import intelligence
+import screening
+import report
 
 MODEL_OUT = "model.joblib"
 RANDOM_STATE = 42
 
-# --- Data-cleaning knobs (mirror train_model.py) ---
-BLANK_TOKENS = {"", "unknown", "nan", "none", "na", "missing", "missing or unspecified"}
+# --- Missing-data semantics -------------------------------------------------
+# Two DISTINCT kinds of "empty" cell, handled differently:
+#   * NOT-DONE ("--", "none", …) -> the step was DELIBERATELY skipped. Real
+#     information: numeric columns take 0 (no amount used), text columns take the
+#     explicit "None" category. Rows made of these are still informative.
+#   * UNKNOWN  ("", "n/a", "unknown", NaN) -> simply not recorded. Numeric columns
+#     are median-imputed; text columns become "Missing"; these carry no info.
+NOT_DONE_TOKENS = {"--", "---", "----", "—", "–", "none", "nil", "no additive",
+                   "no pretreatment", "no post-treatment", "not applied"}
+UNKNOWN_TOKENS = {"", "-", "unknown", "unspecified", "nan", "na", "n/a", "n.a.",
+                  "missing", "missing or unspecified", "tbd", "?", "input",
+                  "..", ".", "x"}
+NOT_DONE_LABEL = "None"       # explicit "step not performed" category label
+# Any empty-ish token (either kind) — used only for numeric auto-detection.
+BLANK_TOKENS = UNKNOWN_TOKENS | NOT_DONE_TOKENS
 MIN_INFORMATIVE_FRAC = 0.10   # drop a row if <10% of its feature cells carry real info
 MAX_MISSING_FRAC = 0.60       # drop a feature if missing in >60% of the kept rows
+
+
+def classify_cell(v):
+    """Classify a raw cell as 'not_done', 'unknown', or None (a real value)."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return "unknown"
+    s = str(v).strip().lower()
+    if s in NOT_DONE_TOKENS:
+        return "not_done"
+    if s in UNKNOWN_TOKENS:
+        return "unknown"
+    return None
+
+
+def coerce_numeric_series(s):
+    """Numeric view of a messy column: 'not-done' -> 0, unknown/unparseable -> NaN."""
+    def one(v):
+        k = classify_cell(v)
+        if k == "not_done":
+            return "0"          # a skipped step contributes no amount
+        if k == "unknown":
+            return None         # -> NaN -> imputed downstream
+        return v
+    return pd.to_numeric(s.map(one), errors="coerce")
+
+
+def normalize_categorical_series(s):
+    """Text view: 'not-done' -> 'None' category, unknown -> 'Missing', else str."""
+    def one(v):
+        k = classify_cell(v)
+        if k == "not_done":
+            return NOT_DONE_LABEL
+        if k == "unknown":
+            return "Missing"
+        return str(v)
+    return s.map(one)
 MAX_CATEGORIES = 25           # drop a text feature with more unique values than this
 
 
@@ -258,6 +310,36 @@ def prepare_raw(df, ids, mixed):
     return df
 
 
+def auto_coerce_numeric(df, protected=(), threshold=0.85, min_unique=3):
+    """
+    Coerce object columns that are *mostly* numeric to real numbers.
+
+    Real spreadsheets often carry one stray annotation (e.g. an 'INPUT' marker
+    row) that flips an otherwise-numeric column to text, which would then be
+    mis-handled as a categorical.  A column whose non-blank cells parse as
+    numbers at least ``threshold`` of the time (and has >= ``min_unique``
+    distinct numeric values) is treated as numeric; unparseable cells become
+    NaN and are imputed downstream.  Columns in ``protected`` (manual overrides)
+    are never touched.
+    """
+    df = df.copy()
+    protected = set(protected)
+    for c in df.columns:
+        if c in protected or pd.api.types.is_numeric_dtype(df[c]):
+            continue
+        s = df[c]
+        # Empty-ish tokens (unknown OR not-done) don't count against the parse
+        # rate — a column of numbers sprinkled with '--' is still numeric.
+        nonblank = s[~s.astype(str).str.strip().str.lower().isin(BLANK_TOKENS)]
+        if len(nonblank) == 0:
+            continue
+        parsed = pd.to_numeric(nonblank, errors="coerce")
+        if parsed.notna().mean() >= threshold and parsed.dropna().nunique() >= min_unique:
+            # 'not-done' cells become 0; unknown/unparseable become NaN (imputed).
+            df[c] = coerce_numeric_series(s)
+    return df
+
+
 def apply_col_type_overrides(df, overrides):
     """
     Force chosen columns to a user-selected type before feature building.
@@ -272,7 +354,7 @@ def apply_col_type_overrides(df, overrides):
         if col not in df.columns:
             continue
         if kind == "numeric":
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+            df[col] = coerce_numeric_series(df[col])   # 'not-done' -> 0
         elif kind == "categorical":
             df[col] = df[col].astype(str)
     return df
@@ -293,6 +375,9 @@ def build_Xy(cfg, notes=None):
 
     df = read_any(cfg["data_path"], sheet=cfg.get("sheet"))
     df = prepare_raw(df, cfg["ids"], cfg["mixed"])
+    # Auto-fix columns that are numeric except for a stray text marker, so a real
+    # temperature/time column isn't mistaken for a categorical. Manual choices win.
+    df = auto_coerce_numeric(df, protected=set(cfg.get("col_types", {}).keys()))
     # Honor manual Numeric/Categorical choices from the "Column types" tab.
     df = apply_col_type_overrides(df, cfg.get("col_types"))
 
@@ -323,7 +408,9 @@ def build_Xy(cfg, notes=None):
     feat_only = [c for c in df.columns if c not in targets]
 
     def informative_frac(row):
-        hits = sum(0 if ((v != v) or str(v).strip().lower() in BLANK_TOKENS) else 1
+        # 'Not-done' cells ARE information (a deliberate no-op); only truly
+        # unknown / unrecorded cells count as uninformative.
+        hits = sum(0 if ((v != v) or str(v).strip().lower() in UNKNOWN_TOKENS) else 1
                    for v in row)
         return hits / len(feat_only) if feat_only else 0.0
 
@@ -354,9 +441,8 @@ def build_Xy(cfg, notes=None):
             X[col] = X[col].fillna(med)
             numeric_schema[col] = med
         else:
-            X[col] = X[col].astype(str).replace(
-                {"nan": "Missing", "None": "Missing"}
-            ).fillna("Missing")
+            # 'not-done' -> explicit "None" category; unknown -> "Missing".
+            X[col] = normalize_categorical_series(X[col])
             categorical_schema[col] = sorted(X[col].unique().tolist())
 
     X_enc = pd.get_dummies(X, drop_first=True)
@@ -439,37 +525,66 @@ def build_models():
 # CAPACITY OPTIMIZER  —  train on controllable knobs, search for the best recipe
 # =============================================================================
 def run_capacity_optimization(data_path, target, excluded, fixed, direction,
-                              min_support=3, random_state=RANDOM_STATE, sheet=None):
+                              min_support=3, random_state=RANDOM_STATE, sheet=None,
+                              features=None, col_types=None, ids=None, mixed=None):
     """
-    Train XGBoost to predict `target` from CONTROLLABLE inputs only (everything
-    except `target` and the `excluded` measured/outcome columns), then use
+    Train XGBoost to predict `target` from CONTROLLABLE inputs only, then use
     differential evolution to find the input recipe with the best predicted
     target. `fixed` pins chosen knobs (e.g. a test current density).
+
+    Which columns are controllable is driven by the Column-types configuration
+    when available: pass ``features`` (the columns tagged role='Feature') and
+    ``col_types`` ({col: 'numeric'|'categorical'}). Everything else — targets,
+    ids, excluded and measured-after-synthesis outcomes — is held out
+    automatically. Without ``features`` it falls back to "everything except the
+    target and the `excluded` list".
 
     Returns a result dict for the UI.
     """
     from xgboost import XGBRegressor
 
     df = read_any(data_path, sheet=sheet)
+    # Drop id columns and split any messy columns into anonymized A/B/C features,
+    # so the optimizer's knobs line up with the training pipeline.
+    df = prepare_raw(df, ids or [], mixed or [])
     if target not in df.columns:
         raise ValueError(f"Target '{target}' not in the file.")
     df[target] = pd.to_numeric(df[target], errors="coerce")
     df = df.dropna(subset=[target]).reset_index(drop=True)
 
-    excluded = set(excluded) | {target}
-    controllable = [c for c in df.columns if c not in excluded]
+    col_types = col_types or {}
+    generated = ("numeric_feature_", "group_label_", "text_modifier_")
+    if features:
+        # COLUMN-TYPE MODE: optimise only over role='Feature' columns (plus any
+        # features generated from parsed messy columns). Targets / ids / excluded
+        # / measured-outcome columns are automatically held out.
+        feat_set = set(features)
+        controllable = [c for c in df.columns
+                        if c != target and (c in feat_set or c.startswith(generated))]
+    else:
+        controllable = [c for c in df.columns if c not in (set(excluded) | {target})]
+    if not controllable:
+        raise ValueError("No controllable columns to optimize. In the Column types "
+                         "tab, mark the synthesis variables you can set as role "
+                         "'Feature' (and the outcome as 'Target').")
     fixed = {k: v for k, v in fixed.items() if k in controllable}
     y = df[target].values
 
-    # Split knobs into numeric ranges and categorical choices.
+    # Split knobs into numeric ranges and categorical choices, honoring the
+    # Column-types Numeric/Categorical assignment (falling back to dtype).
     X_raw = df[controllable].copy()
     numeric_cols, cat_choices = [], {}
     for c in controllable:
-        if pd.api.types.is_numeric_dtype(X_raw[c]):
-            X_raw[c] = X_raw[c].fillna(X_raw[c].median())
+        kind = col_types.get(c)
+        is_num = (kind == "numeric") or (kind is None
+                                         and pd.api.types.is_numeric_dtype(X_raw[c]))
+        if is_num:
+            s = coerce_numeric_series(X_raw[c])   # '--'/'none' -> 0, unknown -> NaN
+            med = s.median()
+            X_raw[c] = s.fillna(0.0 if pd.isna(med) else med)
             numeric_cols.append(c)
         else:
-            X_raw[c] = X_raw[c].astype(str).fillna("NA")
+            X_raw[c] = normalize_categorical_series(X_raw[c])
             counts = X_raw[c].value_counts()
             cat_choices[c] = sorted(counts[counts >= min_support].index.tolist()) \
                 or sorted(counts.index.tolist())
@@ -557,7 +672,9 @@ def run_capacity_optimization(data_path, target, excluded, fixed, direction,
     return dict(target=target, r2=cv_r2, predicted=predicted,
                 obs_min=float(y.min()), obs_max=float(y.max()),
                 recipe=ordered, fixed=set(fixed), edges=edges,
-                n_rows=len(df), n_knobs=len(controllable))
+                n_rows=len(df), n_knobs=len(controllable),
+                mode=("column-type" if features else "manual"),
+                n_numeric=len(numeric_cols), n_categorical=len(cat_choices))
 
 
 # =============================================================================
@@ -630,6 +747,8 @@ class AppState:
         self.compare_current = ""          # model currently being evaluated
         self.compare_total = 0
         self.compare_done = 0
+        self.compare_chart_path = ""
+        self.compare_run = 0
 
         # --- Optimize tab ---
         self.opt_target = "Reversible_Capacity_mAh_per_g"
@@ -655,6 +774,7 @@ class AppState:
         self.charts_pareto_b = 1           # Pareto y-axis target
         self.charts_featx_idx = 0          # optimization-heatmap x feature
         self.charts_featy_idx = 1          # optimization-heatmap y feature
+        self.charts_imp_top_idx = 2        # Top 20 by default
         self.is_charting = False
         self.charts_status = "Train (or load) a model, then Generate charts."
         self.charts_error = ""
@@ -691,6 +811,45 @@ class AppState:
         self.intel_chart_items = []        # [(title, rel_path), ...]
         self.intel_insights = []           # AI Research Assistant lines
         self.intel_conclusion = ""
+
+        # --- Screening engine (BioCarbon Screen decision support) ---
+        self.X_train = None                # encoded training matrix (for AD/similarity)
+        self.y_train = None                # observed targets (DataFrame)
+        self.cv_rmse = {}                  # {target: cross-validated RMSE}
+        self.cv_r2 = {}                    # {target: cross-validated R2}
+        self.screener = None               # screening.Screener built after training
+
+        # --- Screen tab (primary workflow) ---
+        self.screen_target_idx = 0         # which target to screen for
+        self.screen_result = None          # last full screening result dict
+        self.is_screening = False
+        self.screen_error = ""
+        self.screen_live = False           # live What-if: rescreen on any change
+        self.screen_dirty = False          # inputs changed since last screen
+        self.screen_pdf_dialog = None
+        self.screen_xlsx_dialog = None
+        self.screen_import_dialog = None
+        self.screen_import_status = ""
+        self.screen_export_msg = ""
+        self.screen_custom_category = {}   # {categorical col: user-entered unknown value}
+
+        # --- Experiment Prioritization tab ---
+        self.prio_target_idx = 0
+        self.prio_source_path = ""         # candidate spreadsheet (optional)
+        self.prio_source_sheet_names = []
+        self.prio_source_sheet_idx = 0
+        self.prio_source_dialog = None
+        self.prio_save_dialog = None
+        self.is_prioritizing = False
+        self.prio_status = ("Train/load a model, then rank candidates from the "
+                            "optimizer or an imported spreadsheet.")
+        self.prio_error = ""
+        self.prio_df = None                # ranked DataFrame
+        self.prio_w_perf = 0.40
+        self.prio_w_conf = 0.20
+        self.prio_w_novel = 0.15
+        self.prio_w_sim = 0.15
+        self.prio_w_feas = 0.10
 
 
 STATE = AppState()
@@ -947,6 +1106,14 @@ def _train_worker(cfg):
         STATE.cfg = {"ids": cfg["ids"], "mixed": cfg["mixed"]}
         STATE.metrics = metrics
         STATE.importances = list(imp_series.items())
+
+        # Keep the training data + CV metrics for the screening engine
+        # (applicability domain, similar experiments, uncertainty intervals).
+        STATE.X_train = X_enc
+        STATE.y_train = y.reset_index(drop=True)
+        STATE.cv_rmse = {col: m[4] for col, m in zip(targets, metrics)}
+        STATE.cv_r2 = {col: m[3] for col, m in zip(targets, metrics)}
+        rebuild_screener()
         mean_tr = float(np.mean([m[1] for m in metrics]))
         mean_cv = float(np.mean([m[3] for m in metrics]))
         STATE.summary = (
@@ -959,6 +1126,7 @@ def _train_worker(cfg):
         # Seed the predict-tab widgets with sensible defaults.
         STATE.numeric_values = dict(numeric_schema)
         STATE.category_index = {c: 0 for c in categorical_schema}
+        STATE.screen_custom_category = {c: "" for c in categorical_schema}
         STATE.single_pred = None
         STATE.predict_error = ""
 
@@ -1009,16 +1177,38 @@ def _compare_worker(cfg):
             STATE.compare_current = name
             STATE.compare_status = f"Evaluating {name}  ({STATE.compare_done + 1}/{STATE.compare_total})…"
             t0 = time.time()
+            score = rmse = mae = train_r2 = float("nan")
+            predict_ms = float("nan")
             try:
                 oof = cross_val_predict(model, X, y, cv=kf)
                 score = float(r2_score(y, oof, multioutput="uniform_average"))
+                rmse = float(np.sqrt(mean_squared_error(y, oof)))
+                mae = float(np.mean(np.abs(y.values - oof)))
+                cv_secs = time.time() - t0
+                # Train R² (in-sample) + a timed prediction pass for latency.
+                model.fit(X, y)
+                train_r2 = float(r2_score(y, model.predict(X),
+                                          multioutput="uniform_average"))
+                tp = time.time()
+                model.predict(X)
+                predict_ms = 1000.0 * (time.time() - tp) / max(len(X), 1)
             except Exception as e:  # noqa: BLE001 - one bad model shouldn't stop the rest
-                score = float("nan")
+                cv_secs = time.time() - t0
                 print(f"[compare] {name} failed: {e}")
-            STATE.compare_results.append((name, score, time.time() - t0))
+            STATE.compare_results.append(
+                (name, score, cv_secs, rmse, mae, train_r2, predict_ms))
             STATE.compare_done += 1
 
         STATE.compare_current = ""
+        try:
+            import charts as C
+            os.makedirs(CHART_DIR, exist_ok=True)
+            STATE.compare_run += 1
+            STATE.compare_chart_path = C.model_comparison_plot(
+                STATE.compare_results,
+                f"{CHART_DIR}/compare_models_{STATE.compare_run}.png")
+        except Exception as e:  # noqa: BLE001
+            print(f"[compare chart] failed: {e}")
         STATE.compare_status = f"Done. Benchmarked {STATE.compare_total} architectures."
     except Exception as e:  # noqa: BLE001
         STATE.compare_error = f"{type(e).__name__}: {e}"
@@ -1047,6 +1237,16 @@ def start_optimize():
     STATE.opt_result = None
     STATE.opt_status = "Training model on controllable knobs…"
 
+    # COLUMN-TYPE MODE: when the Column types tab has been configured, drive the
+    # optimizer from the per-column roles/types instead of a hand-typed exclusion
+    # list — role='Feature' columns become the knobs, the chosen role='Target'
+    # is the objective, and everything else is held out automatically.
+    features = col_types = None
+    if STATE.coltype_columns:
+        features = [c for c in STATE.coltype_columns
+                    if STATE.coltype_role.get(c) == "feature"]
+        col_types = dict(STATE.coltype_map)
+
     cfg = dict(
         data_path=STATE.data_path,
         target=STATE.opt_target.strip(),
@@ -1054,6 +1254,10 @@ def start_optimize():
         fixed=_parse_fixed(STATE.opt_fixed),
         direction="maximise" if STATE.opt_direction_idx == 0 else "minimise",
         sheet=_current_sheet(),                  # selected worksheet/tab
+        features=features,
+        col_types=col_types,
+        ids=_split_cols(STATE.id_columns),
+        mixed=_split_cols(STATE.mixed_column),
     )
     threading.Thread(target=_optimize_worker, args=(cfg,), daemon=True).start()
 
@@ -1063,11 +1267,16 @@ def _optimize_worker(cfg):
         STATE.opt_status = "Training + searching (this can take a minute)…"
         res = run_capacity_optimization(
             cfg["data_path"], cfg["target"], cfg["excluded"],
-            cfg["fixed"], cfg["direction"], sheet=cfg.get("sheet"))
+            cfg["fixed"], cfg["direction"], sheet=cfg.get("sheet"),
+            features=cfg.get("features"), col_types=cfg.get("col_types"),
+            ids=cfg.get("ids"), mixed=cfg.get("mixed"))
         STATE.opt_result = res
+        src = ("column-type roles" if res.get("mode") == "column-type"
+               else "manual exclusions")
         STATE.opt_status = (
-            f"Done. Model R²={res['r2']:.2f} on {res['n_rows']} rows, "
-            f"{res['n_knobs']} controllable knobs.")
+            f"Done ({src}). Model R²={res['r2']:.2f} on {res['n_rows']} rows, "
+            f"{res['n_knobs']} knobs "
+            f"({res.get('n_numeric', 0)} numeric / {res.get('n_categorical', 0)} categorical).")
     except Exception as e:  # noqa: BLE001
         STATE.opt_error = f"{type(e).__name__}: {e}"
         STATE.opt_status = "Optimization failed."
@@ -1126,6 +1335,7 @@ def start_charts():
         pareto_b=STATE.charts_pareto_b,
         featx=pick(STATE.charts_featx_idx),
         featy=pick(STATE.charts_featy_idx),
+        imp_top=[5, 10, 20, 0][min(max(STATE.charts_imp_top_idx, 0), 3)],
     )
     threading.Thread(target=_charts_worker, args=(cfg, opts), daemon=True).start()
 
@@ -1149,16 +1359,31 @@ def _charts_worker(cfg, opts):
         X_enc = X_enc.astype(float)
         numeric_feats = list(numeric_schema.keys())
 
-        # 1. Correlation heatmap — numeric features + targets.
-        STATE.charts_status = "1/8 · correlation heatmap…"
+        # Correlation and target-signal analysis.
+        STATE.charts_status = "1/13 · correlation analysis…"
         corr_df = pd.concat(
             [X_enc[numeric_feats].reset_index(drop=True), y.reset_index(drop=True)],
             axis=1,
         )
-        items.append(("Correlation heatmap", C.correlation_heatmap(corr_df, path("corr"))))
+        items.append(("Pearson correlation heatmap",
+                      C.correlation_heatmap(corr_df, path("corr_pearson"),
+                                            method="pearson",
+                                            title="Feature and target correlation")))
+        items.append(("Spearman correlation heatmap",
+                      C.correlation_heatmap(corr_df, path("corr_spearman"),
+                                            method="spearman",
+                                            title="Monotonic feature and target correlation")))
+        items.append(("Mutual information ranking",
+                      C.mutual_information_bar(X_enc, y.iloc[:, ti], path("mi"),
+                                               target_name=targets[ti], top=20)))
+        items.append(("Target distribution",
+                      C.target_distribution(y.iloc[:, ti].values, path("target_dist"),
+                                            target_name=targets[ti])))
+        items.append(("Model performance summary",
+                      C.model_performance_summary(STATE.metrics, path("model_perf"))))
 
         # Out-of-fold predictions (shared by charts 2 & 3), same model as training.
-        STATE.charts_status = "2/8 · out-of-fold predictions…"
+        STATE.charts_status = "6/13 · out-of-fold predictions…"
         oof_model = MultiOutputRegressor(ExtraTreesRegressor(
             n_estimators=300, max_depth=12, min_samples_split=4,
             max_features="sqrt", random_state=RANDOM_STATE, n_jobs=-1))
@@ -1168,27 +1393,33 @@ def _charts_worker(cfg, opts):
 
         items.append(("Predicted vs actual",
                       C.predicted_vs_actual(y.values, oof, targets, path("pva"), r2_by)))
-        STATE.charts_status = "3/8 · residual plot…"
+        STATE.charts_status = "7/13 · residual diagnostics…"
         items.append(("Residual plot",
                       C.residual_plot(y.values, oof, targets, path("resid"))))
+        items.append(("Residual distribution",
+                      C.residual_distribution(y.values, oof, targets, path("resid_dist"))))
 
         # 4. Feature importance (folded back to source columns).
-        STATE.charts_status = "4/8 · feature importance…"
+        STATE.charts_status = "9/13 · feature importance…"
         imp_src = _aggregate_importance(STATE.importances, numeric_schema, categorical_schema)
-        items.append(("Feature importance", C.feature_importance(imp_src, path("imp"))))
+        top = opts.get("imp_top", 20)
+        items.append(("Feature importance", C.feature_importance(
+            imp_src, path("imp"), top=top,
+            title="Grouped feature importance"
+            + (" (all features)" if not top else f" (top {top})"))))
 
         # 5 & 6. SHAP on the trained single-target estimator.
         Xs_shap = X_enc.reindex(columns=STATE.feature_columns, fill_value=0)
         est = STATE.model.estimators_[ti] if hasattr(STATE.model, "estimators_") else STATE.model
-        STATE.charts_status = "5/8 · SHAP summary (can be slow)…"
+        STATE.charts_status = "10/13 · SHAP summary (can be slow)…"
         items.append(("SHAP summary",
                       C.shap_summary(est, Xs_shap, path("shap_sum"), targets[ti])))
-        STATE.charts_status = "6/8 · SHAP dependence…"
+        STATE.charts_status = "11/13 · SHAP dependence…"
         items.append(("SHAP dependence",
                       C.shap_dependence(est, Xs_shap, path("shap_dep"), targets[ti])))
 
         # 7. Optimization heatmap — sweep two numeric knobs through the model.
-        STATE.charts_status = "7/8 · optimization heatmap…"
+        STATE.charts_status = "12/13 · optimization heatmap…"
         fx, fy = opts.get("featx"), opts.get("featy")
         if fx not in numeric_feats or fy not in numeric_feats or fx == fy:
             ranked = [f for f in sorted(imp_src, key=lambda k: -imp_src[k])
@@ -1212,8 +1443,8 @@ def _charts_worker(cfg, opts):
                 path("opt"), "Optimization heatmap",
                 "Need at least two numeric features to sweep.")))
 
-        # 8. Pareto front — trade-off between two targets (both maximised).
-        STATE.charts_status = "8/8 · Pareto front…"
+        # Pareto front — trade-off between two targets (both maximised).
+        STATE.charts_status = "13/13 · Pareto front…"
         if len(targets) >= 2:
             a = targets[min(max(opts["pareto_a"], 0), len(targets) - 1)]
             b = targets[min(max(opts["pareto_b"], 0), len(targets) - 1)]
@@ -1323,6 +1554,12 @@ def _latent_worker(cfg, opts):
                                           color_name="Material")))
         items.append(("PCA loadings (PC1)",
                       C.pca_loading_bar(pca["loadings"], path("load"), pc="PC1")))
+        items.append(("PCA variable contribution",
+                      C.pca_variable_contribution(pca["loadings"], path("contrib"),
+                                                  pcs=("PC1", "PC2"))))
+        items.append(("Target distribution",
+                      C.target_distribution(pd.to_numeric(df[cfg.target], errors="coerce"),
+                                            path("target"), target_name=cfg.target)))
 
         # PLS 5-fold CV.
         STATE.lat_status = "Cross-validating PLS…"
@@ -1346,6 +1583,9 @@ def _latent_worker(cfg, opts):
                                             path("ava"), r2)))
         items.append((f"Residuals (C · {used})",
                       C.residual_plot(y_true, y_pred, [cfg.target], path("resid"))))
+        items.append((f"Residual distribution (C · {used})",
+                      C.residual_distribution(y_true, y_pred, [cfg.target],
+                                              path("resid_dist"))))
 
         # Publish.
         STATE.lat_pls_result = pls
@@ -1466,6 +1706,20 @@ def _intel_worker(cfg, opts):
         df = read_any(STATE.data_path, sheet=opts["sheet"])
         if cfg.target not in df.columns:
             raise ValueError(f"Target '{cfg.target}' not found in the sheet.")
+        # Fix numeric columns polluted by a stray text marker (e.g. an 'INPUT'
+        # annotation row) so median imputation / PCA don't choke; never touch
+        # columns the config treats as categorical.
+        df = auto_coerce_numeric(df, protected=set(cfg.categorical) | {cfg.target})
+        # The config EXPLICITLY declares these columns numeric, so force them.
+        # 'not-done' cells ('--', 'none') -> 0; unknown/stray text -> NaN (imputed
+        # or dropped) instead of crashing SimpleImputer(strategy='median') / PCA.
+        _cat_cols, _num_cols = cfg.feature_columns(list(df.columns))
+        for _c in _num_cols:
+            df[_c] = coerce_numeric_series(df[_c])
+        # Text features: '--'/'none' -> explicit "None" category (distinct from an
+        # unrecorded "Missing"), so the model can learn "step skipped" as a signal.
+        for _c in _cat_cols:
+            df[_c] = normalize_categorical_series(df[_c])
 
         prog("1/9 · dataset summary…")
         summary = intelligence.dataset_summary(df, cfg)
@@ -1488,6 +1742,8 @@ def _intel_worker(cfg, opts):
         # ---- Charts (reuse existing plotting code) ----
         items = []
         cat, num = cfg.feature_columns(list(df.columns))
+        items.append(("Missing values",
+                      C.missingness_chart(df, path("missing"))))
         # Predictability
         strength = pred["table"].set_index("feature")["mutual_info"]
         items.append(("Predictability — mutual information",
@@ -1495,15 +1751,23 @@ def _intel_worker(cfg, opts):
                                    title="Feature → target mutual information",
                                    xlabel="mutual information")))
         corr_cols = num + [cfg.target]
-        items.append(("Correlation heatmap",
+        items.append(("Pearson correlation heatmap",
                       C.correlation_heatmap(df[corr_cols].apply(pd.to_numeric, errors="coerce"),
-                                            path("corr"), title="Feature correlation")))
+                                            path("corr"), title="Feature correlation",
+                                            method="pearson")))
+        items.append(("Spearman correlation heatmap",
+                      C.correlation_heatmap(df[corr_cols].apply(pd.to_numeric, errors="coerce"),
+                                            path("corr_spearman"),
+                                            title="Monotonic feature correlation",
+                                            method="spearman")))
         # Redundancy — VIF
         vif_ser = pd.Series({k: v for k, v in redund["vif"].items() if np.isfinite(v)})
         items.append(("Feature redundancy — VIF",
                       C.ranked_bar(vif_ser, path("vif"),
                                    title="Variance Inflation Factor (>10 = redundant)",
                                    xlabel="VIF")))
+        items.append(("Dataset difficulty",
+                      C.dataset_difficulty_chart(summary, diff, learn, path("difficulty"))))
         # Learnability comparison
         learn_r2 = pd.Series({n: s["r2_mean"] for n, s in learn["results"].items()
                               if "r2_mean" in s})
@@ -1538,6 +1802,9 @@ def _intel_worker(cfg, opts):
                                color_series=material, color_name="Material")))
         items.append(("PCA loadings (PC1)",
                       C.pca_loading_bar(pca["loadings"], path("load"), pc="PC1")))
+        items.append(("PCA variable contribution",
+                      C.pca_variable_contribution(pca["loadings"], path("pca_contrib"),
+                                                  pcs=("PC1", "PC2"))))
 
         # ---- AI Research Assistant + conclusion ----
         insights = intelligence.ai_insights(summary, pred, redund, diff, learn,
@@ -1579,8 +1846,16 @@ def intel_export_pdf():
 # PREDICTION HELPERS  (shared by single + batch)
 # =============================================================================
 def build_matrix(X_raw):
-    """One-hot encode a raw feature frame and align it to the trained columns."""
-    X_enc = pd.get_dummies(X_raw, drop_first=True)
+    """One-hot encode a raw feature frame and align it to the trained columns.
+
+    Uses drop_first=False so a single-row prediction keeps the one present
+    category (drop_first=True would drop the only dummy and silently ignore the
+    input); reindexing to the trained columns already omits each baseline dummy.
+    """
+    X_enc = pd.get_dummies(X_raw, drop_first=False)
+    # Overlapping names (e.g. 'Electrolyte' vs 'Electrolyte_Additive') or odd cell
+    # values can yield duplicate dummy columns; keep the first so reindex is safe.
+    X_enc = X_enc.loc[:, ~X_enc.columns.duplicated()]
     return X_enc.reindex(columns=STATE.feature_columns, fill_value=0)
 
 
@@ -1608,18 +1883,19 @@ def predict_batch(path, sheet=None):
         raw = read_any(path, sheet=sheet)
         prepared = prepare_raw(raw, STATE.cfg["ids"], STATE.cfg["mixed"])
 
-        # Rebuild the raw feature frame using the training schema (impute the same way).
+        # Rebuild the raw feature frame using the training schema + the same
+        # 'not-done' (-> 0 / "None") vs unknown (-> impute / "Missing") semantics.
         cols = {}
         for col, med in STATE.numeric_schema.items():
-            series = pd.to_numeric(prepared.get(col), errors="coerce")
-            cols[col] = (series if series is not None else pd.Series([med] * len(prepared))).fillna(med)
+            series = prepared.get(col)
+            if series is None:
+                series = pd.Series([med] * len(prepared))
+            cols[col] = coerce_numeric_series(series).fillna(med)
         for col in STATE.categorical_schema:
             series = prepared.get(col)
             if series is None:
                 series = pd.Series(["Missing"] * len(prepared))
-            cols[col] = series.astype(str).replace(
-                {"nan": "Missing", "None": "Missing"}
-            ).fillna("Missing")
+            cols[col] = normalize_categorical_series(series)
         X_raw = pd.DataFrame(cols)
 
         preds = STATE.model.predict(build_matrix(X_raw))
@@ -1633,6 +1909,22 @@ def predict_batch(path, sheet=None):
         STATE.batch_error = f"Batch prediction failed: {e}"
 
 
+def rebuild_screener():
+    """(Re)build the screening engine from the currently trained model + data."""
+    try:
+        if STATE.model is None or STATE.X_train is None or STATE.y_train is None:
+            STATE.screener = None
+            return
+        STATE.screener = screening.Screener(
+            STATE.model, STATE.feature_columns, STATE.numeric_schema,
+            STATE.categorical_schema, STATE.targets, STATE.X_train, STATE.y_train,
+            cv_rmse=STATE.cv_rmse, cv_r2=STATE.cv_r2,
+        )
+    except Exception as e:  # noqa: BLE001 - screening is optional; never crash training
+        STATE.screener = None
+        STATE.screen_error = f"Could not build screening engine: {e}"
+
+
 def save_model():
     joblib.dump(
         {
@@ -1642,6 +1934,15 @@ def save_model():
             "categorical_schema": STATE.categorical_schema,
             "targets": STATE.targets,
             "cfg": STATE.cfg,
+            # Training data + CV metrics let a reloaded model still screen
+            # (applicability domain, similar experiments, uncertainty).
+            "X_train": STATE.X_train,
+            "y_train": STATE.y_train,
+            "cv_rmse": STATE.cv_rmse,
+            "cv_r2": STATE.cv_r2,
+            "metrics": STATE.metrics,
+            "importances": STATE.importances,
+            "summary": STATE.summary,
         },
         MODEL_OUT,
     )
@@ -1655,10 +1956,170 @@ def load_model():
     STATE.categorical_schema = b["categorical_schema"]
     STATE.targets = b["targets"]
     STATE.cfg = b.get("cfg", {"ids": [], "mixed": ""})
+    STATE.X_train = b.get("X_train")
+    STATE.y_train = b.get("y_train")
+    STATE.cv_rmse = b.get("cv_rmse", {})
+    STATE.cv_r2 = b.get("cv_r2", {})
+    STATE.metrics = b.get("metrics", [])
+    STATE.importances = b.get("importances", [])
+    STATE.summary = b.get("summary", "")
     STATE.numeric_values = dict(STATE.numeric_schema)
     STATE.category_index = {c: 0 for c in STATE.categorical_schema}
+    STATE.screen_custom_category = {c: "" for c in STATE.categorical_schema}
     STATE.trained = True
+    rebuild_screener()
     STATE.status = f"Loaded model from '{MODEL_OUT}'."
+
+
+# =============================================================================
+# SCREENING  (primary workflow — runs the full research-assistant analysis)
+# =============================================================================
+def _current_screen_raw():
+    """Assemble the synthesis-condition dict from the Screen-tab widgets."""
+    row = dict(STATE.numeric_values)
+    for col, choices in STATE.categorical_schema.items():
+        custom = STATE.screen_custom_category.get(col, "").strip()
+        if custom:
+            row[col] = custom
+        else:
+            idx = STATE.category_index.get(col, 0)
+            row[col] = choices[idx] if choices else "Missing"
+    return row
+
+
+def _apply_screen_recipe(raw):
+    """Push one imported/raw recipe into the Screen-tab widgets."""
+    for col, med in STATE.numeric_schema.items():
+        try:
+            v = pd.to_numeric(raw.get(col), errors="coerce")
+            STATE.numeric_values[col] = float(v) if pd.notna(v) else float(med)
+        except Exception:  # noqa: BLE001
+            STATE.numeric_values[col] = float(med)
+
+    for col, choices in STATE.categorical_schema.items():
+        value = raw.get(col, "Missing")
+        value = "Missing" if value is None or (isinstance(value, float) and pd.isna(value)) else str(value)
+        if value in choices:
+            STATE.category_index[col] = choices.index(value)
+            STATE.screen_custom_category[col] = ""
+        else:
+            STATE.category_index[col] = STATE.category_index.get(col, 0)
+            STATE.screen_custom_category[col] = value
+    STATE.screen_dirty = True
+
+
+def import_screen_recipe(path):
+    """Import the first candidate recipe from CSV/Excel into the Screen tab."""
+    try:
+        raw = read_any(path, nrows=1)
+        if raw.empty:
+            raise ValueError("The file has no rows.")
+        prepared = prepare_raw(raw, STATE.cfg.get("ids", []), STATE.cfg.get("mixed", ""))
+        prepared = auto_coerce_numeric(prepared)
+        _apply_screen_recipe(prepared.iloc[0].to_dict())
+        STATE.screen_import_status = f"Imported first recipe from {path}"
+    except Exception as e:  # noqa: BLE001
+        STATE.screen_import_status = f"Recipe import failed: {e}"
+
+
+def start_screen():
+    """Run the full screening workflow on a background thread."""
+    if STATE.is_screening or STATE.screener is None or not STATE.targets:
+        return
+    STATE.is_screening = True
+    STATE.screen_error = ""
+    STATE.screen_dirty = False
+    target = STATE.targets[min(STATE.screen_target_idx, len(STATE.targets) - 1)]
+    raw = _current_screen_raw()
+    threading.Thread(target=_screen_worker, args=(raw, target), daemon=True).start()
+
+
+def _screen_worker(raw, target):
+    try:
+        STATE.screen_result = STATE.screener.screen(raw, target)
+    except Exception as e:  # noqa: BLE001
+        STATE.screen_error = f"{type(e).__name__}: {e}"
+        STATE.screen_result = None
+    finally:
+        STATE.is_screening = False
+
+
+def export_screen_report(path, kind):
+    """Write the current screening result to a PDF or Excel file."""
+    if not STATE.screen_result:
+        STATE.screen_export_msg = "Run a screen first."
+        return
+    try:
+        if kind == "pdf":
+            report.build_prediction_pdf(path, STATE.screen_result, STATE.screener,
+                                        model_summary=STATE.summary)
+        else:
+            report.export_prediction_excel(path, STATE.screen_result, STATE.screener)
+        STATE.screen_export_msg = f"Saved report to {path}"
+    except Exception as e:  # noqa: BLE001
+        STATE.screen_export_msg = f"Export failed: {e}"
+
+
+# =============================================================================
+# EXPERIMENT PRIORITIZATION  (rank candidate synthesis routes)
+# =============================================================================
+def _candidate_rows_from_file(path, sheet=None):
+    """Read candidate recipes from a spreadsheet, aligned to the model schema."""
+    raw = read_any(path, sheet=sheet)
+    prepared = prepare_raw(raw, STATE.cfg.get("ids", []), STATE.cfg.get("mixed", ""))
+    prepared = auto_coerce_numeric(prepared)
+    # Apply the same 'not-done' (0 / "None") vs unknown (median / "Missing") rules.
+    num_cols, cat_cols = {}, {}
+    for c, med in STATE.numeric_schema.items():
+        s = prepared.get(c)
+        num_cols[c] = (coerce_numeric_series(s).fillna(med)
+                       if s is not None else pd.Series([med] * len(prepared)))
+    for c in STATE.categorical_schema:
+        s = prepared.get(c)
+        cat_cols[c] = (normalize_categorical_series(s)
+                       if s is not None else pd.Series(["Missing"] * len(prepared)))
+    rows = []
+    for i in range(len(prepared)):
+        rec = {c: float(num_cols[c].iloc[i]) for c in num_cols}
+        rec.update({c: str(cat_cols[c].iloc[i]) for c in cat_cols})
+        rows.append(rec)
+    return rows
+
+
+def start_prioritize(candidates=None):
+    """Rank candidate synthesis routes on a background thread."""
+    if STATE.is_prioritizing or STATE.screener is None or not STATE.targets:
+        return
+    STATE.is_prioritizing = True
+    STATE.prio_error = ""
+    STATE.prio_status = "Scoring candidates…"
+    target = STATE.targets[min(STATE.prio_target_idx, len(STATE.targets) - 1)]
+    src = STATE.prio_source_path
+    sheet = (STATE.prio_source_sheet_names[STATE.prio_source_sheet_idx]
+             if STATE.prio_source_sheet_names else None)
+    threading.Thread(target=_prioritize_worker, args=(candidates, target, src, sheet),
+                     daemon=True).start()
+
+
+def _prioritize_worker(candidates, target, src, sheet=None):
+    try:
+        if candidates is None:
+            if not src:
+                raise ValueError("Choose a candidate spreadsheet, or optimize first.")
+            candidates = _candidate_rows_from_file(src, sheet=sheet)
+        if not candidates:
+            raise ValueError("No candidate rows found.")
+        weights = {"performance": STATE.prio_w_perf, "confidence": STATE.prio_w_conf,
+                   "novelty": STATE.prio_w_novel, "similarity": STATE.prio_w_sim,
+                   "feasibility": STATE.prio_w_feas}
+        STATE.prio_df = screening.prioritize(STATE.screener, candidates, target, weights)
+        STATE.prio_status = (f"Ranked {len(STATE.prio_df)} candidate(s) for "
+                             f"{target}.")
+    except Exception as e:  # noqa: BLE001
+        STATE.prio_error = f"{type(e).__name__}: {e}"
+        STATE.prio_status = "Prioritization failed."
+    finally:
+        STATE.is_prioritizing = False
 
 
 # =============================================================================
@@ -1980,10 +2441,11 @@ def draw_coltypes_tab():
 
 
 def draw_compare_tab():
-    imgui.text("Benchmark 7 architectures with 5-fold cross-validation")
+    imgui.text("Benchmark multiple architectures with 5-fold cross-validation")
     imgui.text_wrapped(
         "Uses the columns configured in the Train tab. Reports each model's average "
-        "out-of-fold R2 across all 6 targets. This can take a few minutes on full data."
+        "out-of-fold R2, RMSE, MAE, training R2 and prediction latency across every "
+        "configured target. This can take a few minutes on full data."
     )
     imgui.separator()
 
@@ -2008,10 +2470,11 @@ def draw_compare_tab():
     # Live ranked table (best R2 first). NaN = the model errored out.
     if STATE.compare_results:
         imgui.separator()
-        imgui.text("Ranking (highest average OOF R2 first)")
+        imgui.text("Ranking (highest average CV R2 first)")
         flags = imgui.TableFlags_.borders | imgui.TableFlags_.row_bg
-        if imgui.begin_table("compare", 4, flags):
-            for h in ("#", "Model", "Avg OOF R2", "Time"):
+        if imgui.begin_table("compare", 7, flags):
+            for h in ("#", "Model", "CV R2", "CV RMSE", "CV MAE",
+                      "Train R2", "Predict"):
                 imgui.table_setup_column(h)
             imgui.table_headers_row()
             ranked = sorted(
@@ -2019,19 +2482,34 @@ def draw_compare_tab():
                 key=lambda r: (r[1] if r[1] == r[1] else -1e9),  # NaN sinks to bottom
                 reverse=True,
             )
-            for rank, (name, score, secs) in enumerate(ranked, start=1):
+            for rank, row in enumerate(ranked, start=1):
+                name, score, secs, rmse, mae, train_r2, predict_ms = row
                 imgui.table_next_row()
                 imgui.table_next_column(); imgui.text(str(rank))
                 imgui.table_next_column()
-                # Highlight the current best in green.
                 if rank == 1 and score == score:
-                    imgui.text_colored(GREEN, name)
+                    imgui.text_colored(GREEN, name)  # current best
                 else:
                     imgui.text(name)
                 imgui.table_next_column()
-                imgui.text("FAILED" if score != score else f"{score:.4f}")
-                imgui.table_next_column(); imgui.text(f"{secs:.1f}s")
+                imgui.text_colored(
+                    GREEN if score == score and score >= 0.5 else
+                    (RED if score != score or score < 0 else DIM),
+                    "FAILED" if score != score else f"{score:.4f}")
+                imgui.table_next_column(); imgui.text("-" if rmse != rmse else f"{rmse:.3f}")
+                imgui.table_next_column(); imgui.text("-" if mae != mae else f"{mae:.3f}")
+                imgui.table_next_column()
+                imgui.text("-" if train_r2 != train_r2 else f"{train_r2:.4f}")
+                imgui.table_next_column()
+                imgui.text("-" if predict_ms != predict_ms else f"{predict_ms:.2f} ms/row")
             imgui.end_table()
+            imgui.text_colored(DIM, "CV = 5-fold cross-validation (out-of-fold). "
+                               "A large Train-vs-CV R2 gap signals overfitting. "
+                               "Predict = average latency per row.")
+        if STATE.compare_chart_path:
+            imgui.separator()
+            imgui.text_colored(GREEN, "Model comparison figure")
+            _show_chart_image(STATE.compare_chart_path)
 
 
 def _draw_dataframe(df):
@@ -2055,8 +2533,7 @@ def _draw_dataframe(df):
 def draw_optimize_tab():
     imgui.text("Recommend the recipe that maximises (or minimises) a target")
     imgui.text_wrapped(
-        "Trains on CONTROLLABLE knobs only (everything except the target and the "
-        "excluded measured/outcome columns), then searches for the best recipe. "
+        "Trains on CONTROLLABLE knobs only, then searches for the best recipe. "
         "Uses the file chosen in the Train tab.")
     imgui.separator()
 
@@ -2065,16 +2542,56 @@ def draw_optimize_tab():
         return
     imgui.text_colored(DIM, STATE.data_path)
 
-    imgui.set_next_item_width(360)
-    _, STATE.opt_target = imgui.input_text("Target to optimise", STATE.opt_target)
+    # Column-type mode: derive the knobs + held-out columns from the Column
+    # types roles, so there's nothing to hand-type.
+    role = STATE.coltype_role
+    has_roles = bool(STATE.coltype_columns)
+    feats = [c for c in STATE.coltype_columns if role.get(c) == "feature"] if has_roles else []
+    tgts = [c for c in STATE.coltype_columns if role.get(c) == "target"] if has_roles else []
+    held = [c for c in STATE.coltype_columns
+            if role.get(c) in ("target", "id", "exclude", "messy")] if has_roles else []
+
+    if has_roles:
+        imgui.text_colored(GREEN, f"Using Column-types roles: {len(feats)} feature knob(s) "
+                           f"to optimize.")
+        imgui.text_colored(DIM, f"Automatically held out ({len(held)}): "
+                           + ", ".join(held[:12]) + (" …" if len(held) > 12 else ""))
+        # Target: pick from the columns tagged 'Target'.
+        if tgts:
+            if STATE.opt_target not in tgts:
+                STATE.opt_target = tgts[0]
+            ti = tgts.index(STATE.opt_target)
+            imgui.set_next_item_width(360)
+            changed, ti = imgui.combo("Target to optimise", ti, tgts)
+            if changed:
+                STATE.opt_target = tgts[ti]
+        else:
+            imgui.set_next_item_width(360)
+            _, STATE.opt_target = imgui.input_text("Target to optimise", STATE.opt_target)
+            imgui.text_colored(ORANGE, "Tip: tag your outcome column's role as 'Target' "
+                               "in the Column types tab.")
+    else:
+        imgui.text_colored(ORANGE, "No Column-types roles set — using the manual exclusion "
+                           "list below. Configure the Column types tab for automatic "
+                           "knob selection.")
+        imgui.set_next_item_width(360)
+        _, STATE.opt_target = imgui.input_text("Target to optimise", STATE.opt_target)
+
     imgui.set_next_item_width(360)
     _, STATE.opt_direction_idx = imgui.combo("Direction", STATE.opt_direction_idx,
                                              ["maximise", "minimise"])
     imgui.set_next_item_width(360)
     _, STATE.opt_fixed = imgui.input_text("Fixed knobs (col=value, comma-sep)", STATE.opt_fixed)
-    imgui.text_colored(DIM, "Excluded (measured / outcome) columns — one big list:")
-    _, STATE.opt_excluded = imgui.input_text_multiline(
-        "##excluded", STATE.opt_excluded, imgui.ImVec2(-1, 80))
+
+    # The manual exclusion list is only used as a fallback (no roles configured).
+    if not has_roles:
+        imgui.text_colored(DIM, "Excluded (measured / outcome) columns — one big list:")
+        _, STATE.opt_excluded = imgui.input_text_multiline(
+            "##excluded", STATE.opt_excluded, imgui.ImVec2(-1, 80))
+    elif imgui.tree_node("Advanced: manual exclusions (ignored in column-type mode)"):
+        _, STATE.opt_excluded = imgui.input_text_multiline(
+            "##excluded", STATE.opt_excluded, imgui.ImVec2(-1, 80))
+        imgui.tree_pop()
 
     if imgui.button("Run optimization", size=imgui.ImVec2(200, 0)):
         start_optimize()
@@ -2128,6 +2645,32 @@ def _show_chart_image(rel_path):
             raise RuntimeError("zero-size image")
     except Exception:  # noqa: BLE001 - texture path unavailable; offer to open the file
         imgui.text_colored(DIM, rel_path)
+    root, _ = os.path.splitext(rel_path)
+    txt_path = root + ".txt"
+    if os.path.exists(txt_path):
+        try:
+            with open(txt_path, "r", encoding="utf-8") as f:
+                note = f.read().strip()
+            if note:
+                imgui.text_wrapped(note)
+        except Exception:  # noqa: BLE001
+            pass
+    imgui.text_colored(DIM, "Exports:")
+    for ext in (".png", ".svg", ".pdf"):
+        p = root + ext
+        if os.path.exists(p):
+            imgui.same_line()
+            if imgui.small_button(f"Open {ext[1:].upper()}##{p}"):
+                try:
+                    os.startfile(os.path.abspath(p))
+                except Exception:  # noqa: BLE001
+                    pass
+    imgui.same_line()
+    if imgui.small_button(f"Copy path##{rel_path}"):
+        try:
+            imgui.set_clipboard_text(abs_path)
+        except Exception:  # noqa: BLE001
+            pass
     if imgui.small_button(f"Open in viewer##{rel_path}"):
         try:
             os.startfile(abs_path)  # Windows
@@ -2136,11 +2679,12 @@ def _show_chart_image(rel_path):
 
 
 def draw_charts_tab():
-    imgui.text("Diagnostic charts for the trained model")
+    imgui.text("Publication-quality diagnostic charts for the trained model")
     imgui.text_wrapped(
-        "Generates 8 plots: correlation heatmap, predicted-vs-actual, residuals, "
-        "feature importance, SHAP summary & dependence, an optimization heatmap, "
-        "and a Pareto front. Uses the trained model and its data.")
+        "Generates a research chart bundle: Pearson/Spearman correlations, mutual "
+        "information, target distribution, model performance, actual-vs-predicted, "
+        "residual diagnostics, grouped feature importance, SHAP, optimization "
+        "surface and Pareto front. Every figure is exported as PNG, SVG and PDF.")
     imgui.separator()
 
     if not STATE.trained:
@@ -2175,6 +2719,10 @@ def draw_charts_tab():
         imgui.set_next_item_width(200)
         STATE.charts_featy_idx = clamp(STATE.charts_featy_idx, numeric_feats)
         _, STATE.charts_featy_idx = imgui.combo("Heatmap Y", STATE.charts_featy_idx, numeric_feats)
+    imgui.set_next_item_width(180)
+    _, STATE.charts_imp_top_idx = imgui.combo(
+        "Feature importance", STATE.charts_imp_top_idx,
+        ["Top 5", "Top 10", "Top 20", "All features"])
 
     imgui.dummy(imgui.ImVec2(0, 4))
     if imgui.button("Generate charts", size=imgui.ImVec2(200, 0)):
@@ -2480,9 +3028,372 @@ def _draw_learnability_table(learn):
                            "information for the selected target.")
 
 
+ORANGE = (0.95, 0.6, 0.2, 1.0)
+BLUE = (0.45, 0.7, 0.95, 1.0)
+
+
+def _screen_inputs_panel():
+    """Left panel: synthesis-condition widgets shared with the What-if workflow."""
+    imgui.text_colored(BLUE, "Synthesis conditions")
+    imgui.same_line()
+    imgui.text_colored(DIM, "(edit to run a what-if)")
+    if imgui.begin_child("screen_inputs", imgui.ImVec2(0, 0)):
+        for col in STATE.numeric_schema:
+            changed, val = imgui.input_float(col, float(STATE.numeric_values[col]))
+            if changed:
+                STATE.numeric_values[col] = val
+                STATE.screen_dirty = True
+        for col, choices in STATE.categorical_schema.items():
+            STATE.category_index[col] = min(STATE.category_index.get(col, 0),
+                                            max(len(choices) - 1, 0))
+            changed, idx = imgui.combo(col, STATE.category_index[col], choices)
+            if changed:
+                STATE.category_index[col] = idx
+                STATE.screen_dirty = True
+            current = STATE.screen_custom_category.get(col, "")
+            imgui.set_next_item_width(-1)
+            changed, custom = imgui.input_text(f"Other / unknown {col}", current)
+            if changed:
+                STATE.screen_custom_category[col] = custom
+                STATE.screen_dirty = True
+    imgui.end_child()
+
+
+def _draw_similar_table(res, scr):
+    target = res["target"]
+    sims = res["similar"]
+    if not sims:
+        return
+    # Show the most influential synthesis variables as context columns.
+    disp = [f for f, _ in scr.importance[:4] if f in sims[0]["conditions"]]
+    flags = imgui.TableFlags_.borders | imgui.TableFlags_.row_bg
+    ncol = 2 + len(disp)
+    if imgui.begin_table("sim", ncol, flags):
+        imgui.table_setup_column("Similar")
+        imgui.table_setup_column("Measured")
+        for d in disp:
+            imgui.table_setup_column(screening._pretty(d))
+        imgui.table_headers_row()
+        for s in sims:
+            imgui.table_next_row()
+            imgui.table_next_column()
+            sim = s["similarity"]
+            imgui.text_colored(GREEN if sim >= 70 else (ORANGE if sim >= 40 else DIM),
+                               f"{sim:.0f}%")
+            imgui.table_next_column()
+            imgui.text(f"{s['measured'][target]:.1f}")
+            for d in disp:
+                imgui.table_next_column()
+                v = s["conditions"][d]
+                imgui.text(f"{v:g}" if isinstance(v, float) else str(v)[:16])
+        imgui.end_table()
+
+
+def _draw_screen_result(res, scr):
+    """Right panel: the full research-assistant read-out for one recipe."""
+    rec = res["recommendation"]
+    pred = res["prediction"]
+    ad = res["applicability"]
+    mq = res["model_quality"]
+    target = res["target"]
+    tname = screening._pretty(target)
+
+    if imgui.begin_child("screen_results", imgui.ImVec2(0, 0)):
+        # --- Verdict banner ---
+        imgui.text_colored(rec["color"], f"  {rec['verdict'].upper()}  ")
+        imgui.same_line()
+        imgui.text_colored(DIM, f"priority score {rec['score']:.2f}")
+        imgui.separator()
+
+        # --- Prediction + interval ---
+        imgui.text_colored(BLUE, "Estimated performance (prediction, not measurement)")
+        imgui.text(f"{tname}:  ")
+        imgui.same_line()
+        imgui.text_colored(GREEN, f"{pred['mean']:.1f}")
+        imgui.same_line()
+        imgui.text_colored(DIM, f"  95% interval  [{pred['lo']:.1f} , {pred['hi']:.1f}]")
+        conf = rec["confidence"]
+        cc = {"High": GREEN, "Moderate": (0.8, 0.8, 0.3, 1.0),
+              "Low": ORANGE, "Very low": RED}.get(conf, DIM)
+        imgui.text("Confidence: ")
+        imgui.same_line(); imgui.text_colored(cc, conf)
+        imgui.same_line()
+        imgui.text_colored(DIM, f"   ± {pred['expected_error']:.1f} expected error (CV RMSE)")
+        rk = rec["ranking"]["percentile"]
+        imgui.text_colored(DIM, f"Ranks higher than {rk:.0f}% of the "
+                           f"{mq['n_train']} experiments in the dataset.")
+
+        # --- Applicability domain ---
+        imgui.dummy(imgui.ImVec2(0, 3))
+        imgui.text_colored(BLUE, "Applicability domain")
+        imgui.text_colored(GREEN if ad["in_domain"] else RED,
+                           "  " + ("● " + ad["label"]))
+        if res["ood"]:
+            for f in res["ood"]:
+                imgui.text_colored(RED, "  ⚠ " + f)
+        if res["missing"]:
+            imgui.text_colored(ORANGE, "  ⚠ Unspecified: " + ", ".join(res["missing"][:6]))
+
+        # --- Model quality ---
+        cvr2 = mq["cv_r2"]
+        imgui.dummy(imgui.ImVec2(0, 3))
+        imgui.text_colored(BLUE, "Model quality")
+        q = "n/a" if cvr2 is None else f"{cvr2:.3f}"
+        imgui.text_colored(DIM, f"  Cross-validated R² = {q}   ·   "
+                           f"{mq['n_train']} rows · {mq['n_features']} features")
+
+        # --- Why (reasons) ---
+        imgui.dummy(imgui.ImVec2(0, 3))
+        imgui.text_colored(BLUE, "Why this recommendation")
+        for r in rec["reasons"]:
+            col = RED if r.startswith("Warning") or r.startswith("Outside") else None
+            if col:
+                imgui.text_colored(col, "  • " + r)
+            else:
+                imgui.text_wrapped("  • " + r)
+
+        # --- Feature contributions ---
+        contribs = res["contributions"]["contributions"]
+        if contribs:
+            imgui.dummy(imgui.ImVec2(0, 3))
+            imgui.text_colored(BLUE, "What drove this prediction")
+            imgui.text_colored(DIM, "  green raises · red lowers predicted "
+                               + tname)
+            maxabs = max(abs(v) for _, v in contribs) or 1.0
+            for name, v in contribs[:8]:
+                bar = "█" * int(round(10 * abs(v) / maxabs))
+                imgui.text_colored(GREEN if v >= 0 else RED,
+                                   f"  {('+' if v>=0 else '-')}{abs(v):7.1f} {bar}")
+                imgui.same_line()
+                imgui.text(" " + screening._pretty(name))
+
+        # --- What-if sensitivity ---
+        effects = res.get("effect_summary", [])
+        if effects:
+            imgui.dummy(imgui.ImVec2(0, 3))
+            imgui.text_colored(BLUE, "What-if sensitivity")
+            for e in effects[:6]:
+                imgui.text_wrapped("  - " + e["summary"])
+            flags = imgui.TableFlags_.borders | imgui.TableFlags_.row_bg
+            if imgui.begin_table("sens", 3, flags):
+                for h in ("Variable", "Swing", "Direction"):
+                    imgui.table_setup_column(h)
+                imgui.table_headers_row()
+                for e in effects[:6]:
+                    imgui.table_next_row()
+                    imgui.table_next_column(); imgui.text(screening._pretty(e["feature"]))
+                    imgui.table_next_column(); imgui.text(f"{e['swing']:.1f}")
+                    imgui.table_next_column(); imgui.text(str(e["direction"]))
+                imgui.end_table()
+
+        # --- Similar experiments ---
+        imgui.dummy(imgui.ImVec2(0, 3))
+        imgui.text_colored(BLUE, "Most similar real experiments")
+        _draw_similar_table(res, scr)
+
+        # --- Report export ---
+        imgui.dummy(imgui.ImVec2(0, 6))
+        imgui.separator()
+        if imgui.button("Export PDF report"):
+            STATE.screen_pdf_dialog = pfd.save_file(
+                "Save screening report", "BioCarbon_screening_report.pdf",
+                filters=["PDF", "*.pdf"])
+        imgui.same_line()
+        if imgui.button("Export Excel report"):
+            STATE.screen_xlsx_dialog = pfd.save_file(
+                "Save screening report", "BioCarbon_screening_report.xlsx",
+                filters=["Excel", "*.xlsx"])
+        if STATE.screen_export_msg:
+            imgui.text_colored(DIM, STATE.screen_export_msg)
+    imgui.end_child()
+
+
+def draw_screen_tab():
+    """PRIMARY WORKFLOW: enter conditions → predict, quantify, explain, recommend."""
+    if not STATE.trained or STATE.screener is None:
+        imgui.text_colored(DIM, "Train (or load) a model first — see the Train tab. "
+                           "The screening engine is built automatically after training.")
+        return
+
+    # Poll async report-save dialogs.
+    if STATE.screen_pdf_dialog is not None and STATE.screen_pdf_dialog.ready():
+        r = STATE.screen_pdf_dialog.result()
+        if r:
+            export_screen_report(r, "pdf")
+        STATE.screen_pdf_dialog = None
+    if STATE.screen_xlsx_dialog is not None and STATE.screen_xlsx_dialog.ready():
+        r = STATE.screen_xlsx_dialog.result()
+        if r:
+            export_screen_report(r, "xlsx")
+        STATE.screen_xlsx_dialog = None
+    if STATE.screen_import_dialog is not None and STATE.screen_import_dialog.ready():
+        r = STATE.screen_import_dialog.result()
+        if r:
+            import_screen_recipe(r[0])
+        STATE.screen_import_dialog = None
+
+    # Target selector + run controls.
+    imgui.set_next_item_width(320)
+    STATE.screen_target_idx = min(STATE.screen_target_idx, len(STATE.targets) - 1)
+    _, STATE.screen_target_idx = imgui.combo(
+        "Performance target to screen", STATE.screen_target_idx, STATE.targets)
+    if imgui.button("Import recipe (.xlsx / .csv)...", size=imgui.ImVec2(220, 0)):
+        STATE.screen_import_dialog = pfd.open_file(
+            "Import synthesis recipe", filters=["Data", "*.xlsx *.xls *.csv", "All", "*"])
+    if STATE.screen_import_status:
+        imgui.same_line()
+        imgui.text_colored(DIM, STATE.screen_import_status)
+
+    if imgui.button("Screen this recipe", size=imgui.ImVec2(170, 0)):
+        start_screen()
+    imgui.same_line()
+    _, STATE.screen_live = imgui.checkbox("Live what-if", STATE.screen_live)
+    imgui.same_line()
+    if STATE.is_screening:
+        imgui.text_colored(ORANGE, "analyzing…")
+    elif STATE.screen_dirty:
+        imgui.text_colored(DIM, "inputs changed — press Screen")
+
+    # Live mode: re-run automatically once the previous run finishes.
+    if STATE.screen_live and STATE.screen_dirty and not STATE.is_screening:
+        start_screen()
+
+    if STATE.screen_error:
+        imgui.text_colored(RED, STATE.screen_error)
+    imgui.separator()
+
+    # Two-panel layout: inputs on the left, screening read-out on the right.
+    avail = imgui.get_content_region_avail()
+    left_w = max(280.0, avail.x * 0.38)
+    if imgui.begin_child("screen_left", imgui.ImVec2(left_w, 0)):
+        _screen_inputs_panel()
+    imgui.end_child()
+    imgui.same_line()
+    if STATE.screen_result is not None:
+        _draw_screen_result(STATE.screen_result, STATE.screener)
+    else:
+        if imgui.begin_child("screen_hint", imgui.ImVec2(0, 0)):
+            imgui.text_colored(DIM, "Set the synthesis conditions, pick a target, "
+                               "then press \"Screen this recipe\".")
+            imgui.text_wrapped(
+                "You'll get an estimated value with a prediction interval and "
+                "confidence, an applicability-domain check, the most similar real "
+                "experiments, a plain-language recommendation, and the synthesis "
+                "variables that drove the prediction.")
+        imgui.end_child()
+
+
+def draw_priority_tab():
+    """Rank candidate synthesis routes for experimental prioritization."""
+    if not STATE.trained or STATE.screener is None:
+        imgui.text_colored(DIM, "Train (or load) a model first — see the Train tab.")
+        return
+
+    # Poll async dialogs.
+    if STATE.prio_source_dialog is not None and STATE.prio_source_dialog.ready():
+        r = STATE.prio_source_dialog.result()
+        if r:
+            STATE.prio_source_path = r[0]
+            STATE.prio_source_sheet_names = list_sheets(STATE.prio_source_path)
+            STATE.prio_source_sheet_idx = 0
+        STATE.prio_source_dialog = None
+    if STATE.prio_save_dialog is not None and STATE.prio_save_dialog.ready():
+        r = STATE.prio_save_dialog.result()
+        if r and STATE.prio_df is not None:
+            try:
+                if r.lower().endswith(".xlsx"):
+                    STATE.prio_df.to_excel(r, index=False)
+                else:
+                    STATE.prio_df.to_csv(r, index=False)
+                STATE.prio_status = f"Saved ranked list to {r}"
+            except Exception as e:  # noqa: BLE001
+                STATE.prio_error = f"Save failed: {e}"
+        STATE.prio_save_dialog = None
+
+    imgui.text_wrapped(
+        "Rank many candidate synthesis routes so you know which to run first. "
+        "The score blends predicted performance, confidence, novelty, similarity "
+        "to strong experiments and experimental feasibility.")
+    imgui.separator()
+
+    imgui.set_next_item_width(320)
+    STATE.prio_target_idx = min(STATE.prio_target_idx, len(STATE.targets) - 1)
+    _, STATE.prio_target_idx = imgui.combo(
+        "Target to rank by", STATE.prio_target_idx, STATE.targets)
+
+    # Weight sliders.
+    imgui.text_colored(DIM, "Scoring weights")
+    _, STATE.prio_w_perf = imgui.slider_float("Performance", STATE.prio_w_perf, 0.0, 1.0)
+    _, STATE.prio_w_conf = imgui.slider_float("Confidence", STATE.prio_w_conf, 0.0, 1.0)
+    _, STATE.prio_w_novel = imgui.slider_float("Novelty", STATE.prio_w_novel, 0.0, 1.0)
+    _, STATE.prio_w_sim = imgui.slider_float("Similarity", STATE.prio_w_sim, 0.0, 1.0)
+    _, STATE.prio_w_feas = imgui.slider_float("Feasibility", STATE.prio_w_feas, 0.0, 1.0)
+
+    imgui.dummy(imgui.ImVec2(0, 4))
+    imgui.text("Candidate source")
+    if imgui.button("Choose spreadsheet (.xlsx / .csv)..."):
+        STATE.prio_source_dialog = pfd.open_file(
+            "Select candidate recipes", filters=["Data", "*.xlsx *.xls *.csv", "All", "*"])
+    if STATE.prio_source_path:
+        imgui.same_line()
+        imgui.text_colored(DIM, STATE.prio_source_path)
+    if len(STATE.prio_source_sheet_names) > 1:
+        imgui.set_next_item_width(360)
+        STATE.prio_source_sheet_idx = min(STATE.prio_source_sheet_idx,
+                                          len(STATE.prio_source_sheet_names) - 1)
+        _, STATE.prio_source_sheet_idx = imgui.combo(
+            "Candidate sheet / tab", STATE.prio_source_sheet_idx,
+            STATE.prio_source_sheet_names)
+
+    if imgui.button("Rank candidates from file", size=imgui.ImVec2(210, 0)):
+        start_prioritize()
+    imgui.same_line()
+    if imgui.button("Rank the training experiments"):
+        # Re-rank every real recipe the model has seen (a quick sanity ranking).
+        cands = STATE.screener.train_raw.to_dict("records")
+        start_prioritize(candidates=cands)
+    if STATE.opt_result is not None:
+        imgui.same_line()
+        if imgui.button("Rank optimizer recipe"):
+            start_prioritize(candidates=[dict(STATE.opt_result["recipe"])])
+
+    imgui.text_colored(RED if STATE.prio_error else DIM,
+                       STATE.prio_error or STATE.prio_status)
+
+    if STATE.prio_df is not None and len(STATE.prio_df):
+        if imgui.button("Export ranked list..."):
+            STATE.prio_save_dialog = pfd.save_file(
+                "Save ranked list", "BioCarbon_priority_list.xlsx",
+                filters=["Excel", "*.xlsx", "CSV", "*.csv"])
+        imgui.separator()
+        # Show the ranking (headline columns only; full detail is exported).
+        cols = ["rank", "predicted", "interval_low", "interval_high", "confidence",
+                "in_domain", "novelty_pct", "top_similarity_pct", "feasibility",
+                "verdict", "priority_score"]
+        cols = [c for c in cols if c in STATE.prio_df.columns]
+        flags = (imgui.TableFlags_.borders | imgui.TableFlags_.row_bg
+                 | imgui.TableFlags_.scroll_y | imgui.TableFlags_.scroll_x)
+        if imgui.begin_table("prio", len(cols), flags, outer_size=imgui.ImVec2(0, 320)):
+            for c in cols:
+                imgui.table_setup_column(screening._pretty(c))
+            imgui.table_headers_row()
+            for _, r in STATE.prio_df.iterrows():
+                imgui.table_next_row()
+                for c in cols:
+                    imgui.table_next_column()
+                    v = r[c]
+                    if c == "verdict":
+                        imgui.text_colored(screening.VERDICTS.get(v, DIM), str(v))
+                    elif isinstance(v, float):
+                        imgui.text(f"{v:g}")
+                    else:
+                        imgui.text(str(v))
+            imgui.end_table()
+
+
 def gui():
     """Top-level GUI callback — called every frame by imgui-bundle."""
-    imgui.text("🌲 ExtraTrees Multi-Target Trainer & Predictor")
+    imgui.text("🌿 BioCarbon Screen — AI-assisted hard-carbon synthesis screening")
     imgui.same_line()
     # Offer to reuse a previously-saved model.
     if not STATE.trained and os.path.exists(MODEL_OUT):
@@ -2494,6 +3405,13 @@ def gui():
     imgui.separator()
 
     if imgui.begin_tab_bar("tabs"):
+        # PRIMARY WORKFLOW first — the research-assistant screening view.
+        if imgui.begin_tab_item("🔬 Screen")[0]:
+            draw_screen_tab()
+            imgui.end_tab_item()
+        if imgui.begin_tab_item("Prioritize")[0]:
+            draw_priority_tab()
+            imgui.end_tab_item()
         if imgui.begin_tab_item("Train")[0]:
             draw_train_tab()
             imgui.end_tab_item()
@@ -2530,8 +3448,8 @@ def main():
     hello_imgui.set_assets_folder(os.path.dirname(os.path.abspath(__file__)))
     immapp.run(
         gui_function=gui,
-        window_title="RF Trainer & Predictor",
-        window_size=(860, 760),
+        window_title="BioCarbon Screen",
+        window_size=(1080, 820),
     )
 
 
