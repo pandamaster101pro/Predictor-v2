@@ -412,6 +412,12 @@ def build_Xy(cfg, notes=None):
         protected=set(cfg["targets"]) | set(cfg.get("col_types", {}).keys()),
         notes=notes,
     )
+    # The messy-column parser splits concentrations like '3.2%V H2SO4' into a
+    # number plus label columns ('<col>: code' / '<col>: detail').  Rebuild
+    # molarity from those parts and drop the label columns — their information
+    # now lives in the standardized number.
+    df = units.standardize_parsed_mixed(
+        df, notes=notes, labels=mixed_feature_labels(cfg["mixed"]))
     # Auto-fix columns that are numeric except for a stray text marker, so a real
     # temperature/time column isn't mistaken for a categorical. Manual choices win.
     df = auto_coerce_numeric(df, protected=set(cfg.get("col_types", {}).keys()))

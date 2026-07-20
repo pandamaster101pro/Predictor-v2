@@ -29,6 +29,193 @@ import pandas as pd
 
 
 # =============================================================================
+# Chemistry registry for percent concentration -> molarity
+# =============================================================================
+# Values are intentionally small and explicit.  A percent can only become mol/L
+# when we know the solute's molar mass, and density is also required for v/v or
+# w/w conversions.  Unknown solutes/bases are left untouched.
+CHEMICALS: dict[str, dict] = {
+    "h2so4": {
+        "label": "H2SO4",
+        "molar_mass_g_mol": 98.079,
+        "pure_density_g_ml": 1.8305,
+        "solution_density_g_ml": 1.84,
+        "aliases": ["sulfuricacid", "sulphuricacid"],
+    },
+    "h2o2": {
+        "label": "H2O2",
+        "molar_mass_g_mol": 34.0147,
+        "pure_density_g_ml": 1.45,
+        "solution_density_g_ml": 1.13,
+        "aliases": ["hydrogenperoxide"],
+    },
+    "hcl": {
+        "label": "HCl",
+        "molar_mass_g_mol": 36.4609,
+        "solution_density_g_ml": 1.19,
+        "aliases": ["hydrochloricacid"],
+    },
+    "hno3": {
+        "label": "HNO3",
+        "molar_mass_g_mol": 63.012,
+        "solution_density_g_ml": 1.41,
+        "aliases": ["nitricacid"],
+    },
+    "koh": {
+        "label": "KOH",
+        "molar_mass_g_mol": 56.1056,
+        "aliases": ["potassiumhydroxide"],
+    },
+    "naoh": {
+        "label": "NaOH",
+        "molar_mass_g_mol": 39.997,
+        "aliases": ["sodiumhydroxide"],
+    },
+    "nahco3": {
+        "label": "NaHCO3",
+        "molar_mass_g_mol": 84.0066,
+        "aliases": ["sodiumbicarbonate", "sodiumhydrogencarbonate"],
+    },
+    "na2co3": {
+        "label": "Na2CO3",
+        "molar_mass_g_mol": 105.9888,
+        "aliases": ["sodiumcarbonate"],
+    },
+    "li2co3": {
+        "label": "Li2CO3",
+        "molar_mass_g_mol": 73.891,
+        # Common typo/abbreviation in the existing spreadsheet.
+        "aliases": ["lico3", "lithiumcarbonate"],
+    },
+}
+
+
+def _norm_chemical_text(text: str) -> str:
+    """Normalize a formula/name enough for conservative substring matching."""
+    s = str(text).lower()
+    s = s.replace("⋅", "").replace("·", "").replace(".", "")
+    s = s.replace(" ", "").replace("-", "").replace("_", "")
+    return re.sub(r"[^a-z0-9]", "", s)
+
+
+_CHEM_LOOKUP: dict[str, dict] = {}
+for _formula, _info in CHEMICALS.items():
+    _CHEM_LOOKUP[_norm_chemical_text(_formula)] = _info
+    for _alias in _info.get("aliases", []):
+        _CHEM_LOOKUP[_norm_chemical_text(_alias)] = _info
+
+
+def _find_chemical(*texts):
+    haystack = " ".join(str(t) for t in texts if t is not None)
+    norm = _norm_chemical_text(haystack)
+    hits = []
+    for key, info in _CHEM_LOOKUP.items():
+        if key and key in norm:
+            hits.append((len(key), key, info))
+    if not hits:
+        return None
+    # Longest match wins so Na2CO3 beats shorter accidental pieces.
+    return sorted(hits, reverse=True)[0][2]
+
+
+_MOLAR_RE = re.compile(
+    r"^\s*([-+]?[\d,]*\.?\d+)\s*"
+    r"(?:M(?=\s|[A-Z0-9(]|$)|[Mm]olar\b|[Mm]ol\s*/\s*[Ll]\b)"
+    r"\s*([A-Za-z0-9()⋅·.\-\s]*)",
+)
+_PERCENT_RE = re.compile(
+    r"^\s*([-+]?[\d,]*\.?\d+)\s*"
+    r"(?P<prefix>w\s*/\s*v|v\s*/\s*v|w\s*/\s*w|vol|wt|v|w)?\s*"
+    r"%\s*"
+    r"(?P<suffix>w\s*/\s*v|v\s*/\s*v|w\s*/\s*w|vol|wt|v|w)?\s*"
+    r"(?P<rest>.*)$",
+    re.I,
+)
+
+
+def _percent_basis(prefix, suffix, column_name):
+    raw = (prefix or suffix or "").strip().lower().replace(" ", "")
+    if not raw:
+        # Let an explicit header such as "H2SO4 concentration (%V)" provide the
+        # basis for bare cell values like "3.2".
+        lower = str(column_name).lower().replace(" ", "")
+        if "%v" in lower or "v%" in lower or "v/v" in lower or "vol%" in lower:
+            raw = "v"
+        elif "%w/v" in lower or "w/v" in lower:
+            raw = "w/v"
+        elif "wt%" in lower or "%wt" in lower or "w/w" in lower:
+            raw = "wt"
+    if raw in {"v", "vol", "v/v"}:
+        return "v/v"
+    if raw in {"w/v"}:
+        return "w/v"
+    if raw in {"w", "wt", "w/w"}:
+        return "w/w"
+    return None
+
+
+def _molarity_from_percent(pct: float, basis: str, chem: dict):
+    mm = chem.get("molar_mass_g_mol")
+    if not mm:
+        return None
+    if basis == "w/v":
+        return 10.0 * pct / mm
+    if basis == "v/v":
+        density = chem.get("pure_density_g_ml")
+        return None if density is None else 10.0 * pct * density / mm
+    if basis == "w/w":
+        density = chem.get("solution_density_g_ml")
+        return None if density is None else 10.0 * pct * density / mm
+    return None
+
+
+def parse_concentration_to_molarity(value, column_name: str = ""):
+    """
+    Convert concentration text to molarity when chemistry is unambiguous.
+
+    Supports already-molar values (``1M KOH``), explicit percent v/v
+    (``1.25v% H2SO4``), percent w/v, and percent w/w when the registry has a
+    solution density.  Returns ``(molarity, solute_label, basis)`` or ``None``.
+    """
+    if _is_blank(value):
+        return None
+    text = str(value).strip()
+
+    m = _MOLAR_RE.match(text)
+    if m:
+        try:
+            molarity = float(m.group(1).replace(",", ""))
+        except ValueError:
+            return None
+        chem = _find_chemical(m.group(2), column_name)
+        label = chem["label"] if chem else "M"
+        return molarity, label, "M"
+
+    m = _PERCENT_RE.match(text)
+    if not m:
+        return None
+    try:
+        pct = float(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
+    # Values such as "30mole%" are ratios/doping, not solution concentration.
+    if "mole" in text.lower() or "mol%" in text.lower():
+        return None
+
+    basis = _percent_basis(m.group("prefix"), m.group("suffix"), column_name)
+    if basis is None:
+        return None
+    chem = _find_chemical(m.group("rest"), column_name)
+    if chem is None:
+        return None
+
+    molarity = _molarity_from_percent(pct, basis, chem)
+    if molarity is None:
+        return None
+    return molarity, chem["label"], basis
+
+
+# =============================================================================
 # Unit registry
 # =============================================================================
 # Each physical DIMENSION declares a default canonical unit plus the aliases
@@ -190,6 +377,162 @@ def _header_unit(name: str):
     return hit[0], norm
 
 
+def _header_percent_context(colname: str):
+    basis = _percent_basis(None, None, colname)
+    chem = _find_chemical(colname)
+    if basis is None or chem is None:
+        return None, None
+    return basis, chem
+
+
+def _standardize_concentration_column(series: pd.Series, colname: str):
+    """Return (new_series, note) for concentration -> M, else None."""
+    vals = list(series)
+    header_basis, header_chem = _header_percent_context(colname)
+    out_vals, bases, solutes = [], set(), set()
+    n_nonblank = n_conv = 0
+
+    for v in vals:
+        if _is_blank(v):
+            out_vals.append(v)
+            continue
+        n_nonblank += 1
+
+        parsed = parse_concentration_to_molarity(v, column_name=colname)
+        if parsed is not None:
+            molarity, solute, basis = parsed
+            out_vals.append(molarity)
+            bases.add(basis); solutes.add(solute); n_conv += 1
+            continue
+
+        # Header-driven case: column says "H2SO4 concentration (%V)" and cells
+        # are bare numbers like 3.2.
+        if header_basis is not None and header_chem is not None:
+            num, unit = _split_num_unit(v)
+            if num is not None and unit is None:
+                molarity = _molarity_from_percent(num, header_basis, header_chem)
+                if molarity is not None:
+                    out_vals.append(molarity)
+                    bases.add(header_basis); solutes.add(header_chem["label"]); n_conv += 1
+                    continue
+
+        out_vals.append(v)
+
+    if n_conv == 0 or n_nonblank == 0 or n_conv / n_nonblank < 0.7:
+        return None
+    basis_desc = ", ".join(sorted(bases))
+    solute_desc = ", ".join(sorted(solutes))
+    note = (f"Standardized concentration in '{colname}': "
+            f"{solute_desc} {basis_desc} -> M ({n_conv} value(s)).")
+    return pd.Series(out_vals, index=series.index), note
+
+
+# =============================================================================
+# Parsed messy-column triples  (numeric_feature_A* + their label columns)
+# =============================================================================
+# The app's messy-column parser splits a cell like '3.2%V H2SO4' into a number
+# plus two LABEL columns:  numeric_feature_A*=3.2, group_label_B*='V',
+# text_modifier_C*='h2so4'.  When those labels identify a percent basis and a
+# registry chemical, the number can be rewritten as molarity and the label
+# columns removed — their information then lives entirely in the number.
+_TRIPLE_A_RE = re.compile(r"^numeric_feature_A(\d*)$")
+
+# Percent-basis codes as they appear in the parser's "code" label (the token
+# that followed the number in the raw cell, upper-cased by the parser).
+_BASIS_CODES = {"v": "v/v", "vv": "v/v", "vol": "v/v",
+                "wv": "w/v",
+                "w": "w/w", "wt": "w/w", "ww": "w/w"}
+
+
+def molarity_from_parts(amount, code, text):
+    """Molarity from one parsed messy-cell triple, or None if ambiguous.
+
+    ``code``/``text`` are the label parts the messy-column parser emits:
+    '3.2%V H2SO4' -> (3.2, 'V', 'h2so4') and '1M KOH' -> (1.0, 'M', 'koh').
+    A conversion needs a registry chemical AND either an explicit molar 'M'
+    code or a recognized percent basis, so doping codes like '15% Mn' and
+    plain amounts never convert.
+    """
+    code_n = str(code or "").strip().lower()
+    text_n = str(text or "").strip().lower()
+    # '0.2 w/v% NaHCO3' parses as code 'W' + text '/v nahco3' — reunite them.
+    m = re.match(r"^/\s*([a-z])\b\s*(.*)$", text_n)
+    if m:
+        code_n, text_n = code_n + m.group(1), m.group(2)
+    chem = _find_chemical(text_n)
+    if chem is None:
+        return None
+    if code_n == "m":                     # '1M KOH' — already molar
+        try:
+            return float(amount)
+        except (TypeError, ValueError):
+            return None
+    basis = _BASIS_CODES.get(code_n)
+    if basis is None:
+        return None
+    try:
+        return _molarity_from_percent(float(amount), basis, chem)
+    except (TypeError, ValueError):
+        return None
+
+
+def standardize_parsed_mixed(df: pd.DataFrame, notes: list | None = None,
+                             labels: dict | None = None, protected=()) -> pd.DataFrame:
+    """Convert parsed messy-column triples to molarity and DROP their labels.
+
+    Runs after :func:`standardize_units`.  For every triple whose label columns
+    give an unambiguous basis + chemical for at least 70% of the informative
+    rows (and at least 2 rows), the numeric column is rewritten as mol/L and
+    both label columns are removed.  'Not-done' rows (labels blank/'None')
+    keep their 0.0.  Triples that don't look like concentrations — dopants,
+    plain amounts, unknown chemicals — are left untouched, labels included.
+
+    ``labels`` optionally maps internal column names to display names for the
+    ``notes`` messages.
+    """
+    out = df.copy()
+    labels = dict(labels or {})
+    protected = {str(c) for c in protected}
+    for a_col in list(out.columns):
+        m = _TRIPLE_A_RE.match(str(a_col))
+        if m is None or str(a_col) in protected:
+            continue
+        b_col = f"group_label_B{m.group(1)}"
+        c_col = f"text_modifier_C{m.group(1)}"
+        if b_col not in out.columns or c_col not in out.columns:
+            continue
+
+        new_vals, n_informative, n_conv = [], 0, 0
+        solutes = set()
+        for amt, code, txt in zip(out[a_col], out[b_col], out[c_col]):
+            code_blank = _is_blank(code) or str(code).strip().lower() == "none"
+            txt_blank = _is_blank(txt) or str(txt).strip().lower() == "none"
+            if code_blank and txt_blank:
+                new_vals.append(amt)          # 'not done' -> stays 0.0
+                continue
+            n_informative += 1
+            mol = molarity_from_parts(amt, code, txt)
+            if mol is None:
+                new_vals.append(amt)
+            else:
+                new_vals.append(mol)
+                n_conv += 1
+                chem = _find_chemical(txt)
+                if chem is not None:
+                    solutes.add(chem["label"])
+
+        if n_conv < 2 or n_informative == 0 or n_conv / n_informative < 0.7:
+            continue
+        out[a_col] = pd.Series(new_vals, index=out.index, dtype=float)
+        out = out.drop(columns=[b_col, c_col])
+        if notes is not None:
+            solute_desc = ", ".join(sorted(solutes)) or "?"
+            notes.append(f"Standardized '{labels.get(a_col, a_col)}' to molarity "
+                         f"(M; {solute_desc}) and removed its label columns "
+                         f"'{labels.get(b_col, b_col)}' and '{labels.get(c_col, c_col)}'.")
+    return out
+
+
 def _convert(value: float, dim: str, src_norm: str, target_norm: str) -> float:
     """Convert ``value`` from ``src_norm`` to ``target_norm`` within one dimension."""
     _, conv = _LOOKUP[src_norm]
@@ -327,7 +670,9 @@ def standardize_units(df: pd.DataFrame, canonical: dict | None = None,
         if str(col) in protected:
             continue
         try:
-            result = _standardize_column(out[col], str(col), canonical)
+            result = _standardize_concentration_column(out[col], str(col))
+            if result is None:
+                result = _standardize_column(out[col], str(col), canonical)
         except Exception:      # noqa: BLE001 - standardization must never break a load
             result = None
         if result is None:
