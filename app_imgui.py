@@ -319,6 +319,21 @@ def mixed_feature_labels(mixed, columns=None):
     return labels
 
 
+def feature_label(col):
+    """Display name for an internal feature column.
+
+    Parsed messy-column parts (numeric_feature_A1, group_label_B5, ...) map to
+    '<original column>: number/percent | code | detail'; anything else is
+    returned unchanged. The map is set at train/load time (STATE.feature_labels).
+    """
+    return STATE.feature_labels.get(str(col), str(col))
+
+
+def pretty(col):
+    """Human-friendly label for any feature/target name shown in the UI."""
+    return screening._pretty(feature_label(col))
+
+
 def prepare_raw(df, ids, mixed):
     """
     Drop id columns and parse+drop every messy column into its own anonymized
@@ -790,6 +805,7 @@ class AppState:
         # --- Predict tab widget values ---
         self.numeric_values = {}           # {col: float}
         self.category_index = {}           # {col: chosen index}
+        self.feature_labels = {}           # {internal col: display label}
         self.single_pred = None            # [(target, value), ...]
         self.predict_error = ""
 
@@ -1178,6 +1194,7 @@ def _train_worker(cfg):
         STATE.categorical_schema = categorical_schema
         STATE.targets = targets
         STATE.cfg = {"ids": cfg["ids"], "mixed": cfg["mixed"]}
+        STATE.feature_labels = mixed_feature_labels(cfg["mixed"])
         STATE.metrics = metrics
         STATE.importances = list(imp_series.items())
 
@@ -1491,7 +1508,7 @@ def _charts_worker(cfg, opts):
         imp_src = _aggregate_importance(STATE.importances, numeric_schema, categorical_schema)
         top = opts.get("imp_top", 20)
         items.append(("Feature importance", C.feature_importance(
-            imp_src, path("imp"), top=top,
+            {feature_label(k): v for k, v in imp_src.items()}, path("imp"), top=top,
             title="Grouped feature importance"
             + (" (all features)" if not top else f" (top {top})"))))
 
@@ -2006,6 +2023,7 @@ def rebuild_screener():
             STATE.model, STATE.feature_columns, STATE.numeric_schema,
             STATE.categorical_schema, STATE.targets, STATE.X_train, STATE.y_train,
             cv_rmse=STATE.cv_rmse, cv_r2=STATE.cv_r2,
+            display_labels=STATE.feature_labels,
         )
     except Exception as e:  # noqa: BLE001 - screening is optional; never crash training
         STATE.screener = None
@@ -2030,6 +2048,7 @@ def save_model():
             "metrics": STATE.metrics,
             "importances": STATE.importances,
             "summary": STATE.summary,
+            "feature_labels": STATE.feature_labels,
         },
         MODEL_OUT,
     )
@@ -2043,6 +2062,8 @@ def load_model():
     STATE.categorical_schema = b["categorical_schema"]
     STATE.targets = b["targets"]
     STATE.cfg = b.get("cfg", {"ids": [], "mixed": ""})
+    STATE.feature_labels = (b.get("feature_labels")
+                            or mixed_feature_labels(STATE.cfg.get("mixed", "")))
     STATE.X_train = b.get("X_train")
     STATE.y_train = b.get("y_train")
     STATE.cv_rmse = b.get("cv_rmse", {})
@@ -2312,7 +2333,7 @@ def draw_train_tab():
             imgui.table_headers_row()
             for feat, imp in STATE.importances[:5]:
                 imgui.table_next_row()
-                imgui.table_next_column(); imgui.text(str(feat))
+                imgui.table_next_column(); imgui.text(feature_label(feat))
                 imgui.table_next_column(); imgui.text(f"{imp * 100:.2f}%")
             imgui.end_table()
 
@@ -2327,11 +2348,13 @@ def draw_predict_tab():
 
     if imgui.begin_child("inputs", imgui.ImVec2(0, 300)):
         for col in STATE.numeric_schema:
-            changed, val = imgui.input_float(col, float(STATE.numeric_values[col]))
+            changed, val = imgui.input_float(f"{feature_label(col)}##num_{col}",
+                                             float(STATE.numeric_values[col]))
             if changed:
                 STATE.numeric_values[col] = val
         for col, choices in STATE.categorical_schema.items():
-            changed, idx = imgui.combo(col, STATE.category_index[col], choices)
+            changed, idx = imgui.combo(f"{feature_label(col)}##cat_{col}",
+                                       STATE.category_index[col], choices)
             if changed:
                 STATE.category_index[col] = idx
     imgui.end_child()
@@ -3141,20 +3164,23 @@ def _screen_inputs_panel():
     imgui.text_colored(DIM, "(edit to run a what-if)")
     if imgui.begin_child("screen_inputs", imgui.ImVec2(0, 0)):
         for col in STATE.numeric_schema:
-            changed, val = imgui.input_float(col, float(STATE.numeric_values[col]))
+            changed, val = imgui.input_float(f"{feature_label(col)}##snum_{col}",
+                                             float(STATE.numeric_values[col]))
             if changed:
                 STATE.numeric_values[col] = val
                 STATE.screen_dirty = True
         for col, choices in STATE.categorical_schema.items():
             STATE.category_index[col] = min(STATE.category_index.get(col, 0),
                                             max(len(choices) - 1, 0))
-            changed, idx = imgui.combo(col, STATE.category_index[col], choices)
+            changed, idx = imgui.combo(f"{feature_label(col)}##scat_{col}",
+                                       STATE.category_index[col], choices)
             if changed:
                 STATE.category_index[col] = idx
                 STATE.screen_dirty = True
             current = STATE.screen_custom_category.get(col, "")
             imgui.set_next_item_width(-1)
-            changed, custom = imgui.input_text(f"Other / unknown {col}", current)
+            changed, custom = imgui.input_text(
+                f"Other / unknown {feature_label(col)}##soth_{col}", current)
             if changed:
                 STATE.screen_custom_category[col] = custom
                 STATE.screen_dirty = True
@@ -3174,7 +3200,7 @@ def _draw_similar_table(res, scr):
         imgui.table_setup_column("Similar")
         imgui.table_setup_column("Measured")
         for d in disp:
-            imgui.table_setup_column(screening._pretty(d))
+            imgui.table_setup_column(pretty(d))
         imgui.table_headers_row()
         for s in sims:
             imgui.table_next_row()
@@ -3198,7 +3224,7 @@ def _draw_screen_result(res, scr):
     ad = res["applicability"]
     mq = res["model_quality"]
     target = res["target"]
-    tname = screening._pretty(target)
+    tname = pretty(target)
 
     if imgui.begin_child("screen_results", imgui.ImVec2(0, 0)):
         # --- Verdict banner ---
@@ -3267,7 +3293,7 @@ def _draw_screen_result(res, scr):
                 imgui.text_colored(GREEN if v >= 0 else RED,
                                    f"  {('+' if v>=0 else '-')}{abs(v):7.1f} {bar}")
                 imgui.same_line()
-                imgui.text(" " + screening._pretty(name))
+                imgui.text(" " + pretty(name))
 
         # --- What-if sensitivity ---
         effects = res.get("effect_summary", [])
@@ -3283,7 +3309,7 @@ def _draw_screen_result(res, scr):
                 imgui.table_headers_row()
                 for e in effects[:6]:
                     imgui.table_next_row()
-                    imgui.table_next_column(); imgui.text(screening._pretty(e["feature"]))
+                    imgui.table_next_column(); imgui.text(pretty(e["feature"]))
                     imgui.table_next_column(); imgui.text(f"{e['swing']:.1f}")
                     imgui.table_next_column(); imgui.text(str(e["direction"]))
                 imgui.end_table()
@@ -3477,7 +3503,7 @@ def draw_priority_tab():
                  | imgui.TableFlags_.scroll_y | imgui.TableFlags_.scroll_x)
         if imgui.begin_table("prio", len(cols), flags, outer_size=imgui.ImVec2(0, 320)):
             for c in cols:
-                imgui.table_setup_column(screening._pretty(c))
+                imgui.table_setup_column(pretty(c))
             imgui.table_headers_row()
             for _, r in STATE.prio_df.iterrows():
                 imgui.table_next_row()

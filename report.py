@@ -16,13 +16,12 @@ import tempfile
 import pandas as pd
 
 import charts as C
-import screening as S
 
 
 # =============================================================================
 # Small matplotlib helpers  (headless Agg backend so it never needs a window)
 # =============================================================================
-def _contrib_png(result, path):
+def _contrib_png(result, screener, path):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -30,7 +29,7 @@ def _contrib_png(result, path):
     contribs = result["contributions"]["contributions"][:8][::-1]
     if not contribs:
         return None
-    names = [S._pretty(n) for n, _ in contribs]
+    names = [screener.pretty(n) for n, _ in contribs]
     vals = [v for _, v in contribs]
     colors = ["#3aa856" if v >= 0 else "#cc4b3b" for v in vals]
     fig, ax = plt.subplots(figsize=(6.6, 3.4), dpi=130)
@@ -38,7 +37,7 @@ def _contrib_png(result, path):
     ax.set_yticks(range(len(names)))
     ax.set_yticklabels(names, fontsize=8)
     ax.axvline(0, color="#888", lw=0.8)
-    ax.set_xlabel(f"Contribution to predicted {S._pretty(result['target'])}", fontsize=8)
+    ax.set_xlabel(f"Contribution to predicted {screener.pretty(result['target'])}", fontsize=8)
     ax.set_title("Why the model made this prediction", fontsize=9)
     fig.tight_layout()
     fig.savefig(path, bbox_inches="tight")
@@ -59,7 +58,7 @@ def _interval_png(result, screener, path):
     ax.axvspan(pred["lo"], pred["hi"], color="#3aa856", alpha=0.18,
                label="95% prediction interval")
     ax.axvline(pred["mean"], color="#1f6f3f", lw=2, label="prediction")
-    ax.set_xlabel(f"{S._pretty(t)}  (dataset distribution vs this prediction)", fontsize=8)
+    ax.set_xlabel(f"{screener.pretty(t)}  (dataset distribution vs this prediction)", fontsize=8)
     ax.legend(fontsize=7)
     fig.tight_layout()
     fig.savefig(path, bbox_inches="tight")
@@ -119,7 +118,7 @@ def build_prediction_pdf(path, result, screener, model_summary=""):
     story.append(Paragraph("Prediction summary", h2))
     ci = mq["cv_r2"]
     pred_tbl = [
-        ["Target", S._pretty(t)],
+        ["Target", screener.pretty(t)],
         ["Estimated value", f"{pred['mean']:.1f}"],
         ["95% prediction interval", f"{pred['lo']:.1f}  to  {pred['hi']:.1f}"],
         ["Expected error (CV RMSE)", f"± {pred['expected_error']:.1f}"],
@@ -148,7 +147,7 @@ def build_prediction_pdf(path, result, screener, model_summary=""):
     for r in rec["reasons"]:
         story.append(Paragraph("• " + r, body))
     try:
-        img = _contrib_png(result, os.path.join(tmpdir, "contrib.png"))
+        img = _contrib_png(result, screener, os.path.join(tmpdir, "contrib.png"))
         if img:
             story.append(Spacer(1, 4))
             story.append(Image(img, width=165 * mm, height=85 * mm))
@@ -161,7 +160,7 @@ def build_prediction_pdf(path, result, screener, model_summary=""):
             story.append(Paragraph("- " + e["summary"], body))
         rows = [["Variable", "Prediction swing", "Direction"]]
         for e in result["effect_summary"][:6]:
-            rows.append([S._pretty(e["feature"]), f"{e['swing']:.1f}",
+            rows.append([screener.pretty(e["feature"]), f"{e['swing']:.1f}",
                          str(e["direction"])])
         st = Table(rows, colWidths=[75 * mm, 45 * mm, 50 * mm])
         st.setStyle(_grid_style(colors))
@@ -180,7 +179,7 @@ def build_prediction_pdf(path, result, screener, model_summary=""):
     story.append(Paragraph("Input synthesis conditions", h2))
     rows = [["Variable", "Value"]]
     for c, v in result["raw"].items():
-        rows.append([S._pretty(c), _fmt(v)])
+        rows.append([screener.pretty(c), _fmt(v)])
     it = Table(rows, colWidths=[85 * mm, 85 * mm])
     it.setStyle(_grid_style(colors))
     story.append(it)
@@ -196,8 +195,8 @@ def build_prediction_pdf(path, result, screener, model_summary=""):
             story.append(Spacer(1, 4))
         except Exception:
             pass
-        hdr = ["Similarity", "Measured " + S._pretty(t)] + \
-              [S._pretty(c) for c in list(result["similar"][0]["conditions"])[:4]]
+        hdr = ["Similarity", "Measured " + screener.pretty(t)] + \
+              [screener.pretty(c) for c in list(result["similar"][0]["conditions"])[:4]]
         rows = [hdr]
         for s in result["similar"][:6]:
             row = [f"{s['similarity']:.0f}%", f"{s['measured'][t]:.1f}"]
@@ -210,7 +209,7 @@ def build_prediction_pdf(path, result, screener, model_summary=""):
 
     # --- Suggested next experiments ---
     story.append(Paragraph("Suggested next steps", h2))
-    story.append(Paragraph(_next_steps(result), body))
+    story.append(Paragraph(_next_steps(result, screener), body))
 
     if model_summary:
         story.append(Spacer(1, 6))
@@ -252,9 +251,9 @@ def _fmt(v):
     return str(v)
 
 
-def _next_steps(result):
+def _next_steps(result, screener):
     rec = result["recommendation"]
-    t = S._pretty(result["target"])
+    t = screener.pretty(result["target"])
     v = rec["verdict"]
     if v in ("Excellent candidate", "Strong candidate"):
         base = (f"This route is a priority for the bench: the model predicts a "
@@ -289,7 +288,7 @@ def export_prediction_excel(path, result, screener):
                   "Expected error (CV RMSE)", "Confidence", "Verdict",
                   "Priority score", "Ranking percentile", "Applicability domain",
                   "In domain?", "Model CV R2", "Training rows", "Encoded features"],
-        "Value": [S._pretty(t), round(pred["mean"], 2), round(pred["lo"], 2),
+        "Value": [screener.pretty(t), round(pred["mean"], 2), round(pred["lo"], 2),
                   round(pred["hi"], 2), round(pred["expected_error"], 2),
                   rec["confidence"], rec["verdict"], round(rec["score"], 3),
                   round(rec["ranking"]["percentile"], 1),

@@ -126,13 +126,17 @@ class Screener:
     """Wraps a trained model + its training data to answer screening questions."""
 
     def __init__(self, model, feature_columns, numeric_schema, categorical_schema,
-                 targets, X_train, y_train, cv_rmse=None, cv_r2=None):
+                 targets, X_train, y_train, cv_rmse=None, cv_r2=None,
+                 display_labels=None):
         self.model = model
         self.feature_columns = list(feature_columns)
         self._col_index = {c: i for i, c in enumerate(self.feature_columns)}
         self.numeric_schema = dict(numeric_schema)
         self.categorical_schema = {k: list(v) for k, v in categorical_schema.items()}
         self.targets = list(targets)
+        # Display names for internal feature columns (e.g. the app's parsed
+        # messy-column parts: numeric_feature_A1 -> "Pretreat 1: number/percent").
+        self.labels = {str(k): str(v) for k, v in (display_labels or {}).items()}
 
         self.X_train = X_train[self.feature_columns].astype(float)
         self.y_train = y_train.reset_index(drop=True)
@@ -173,6 +177,10 @@ class Screener:
         self.orig_map = feature_to_original(self.feature_columns,
                                             self.numeric_schema, self.categorical_schema)
         self.importance = self._global_importance()
+
+    def pretty(self, name):
+        """Human-friendly label: display name when one exists, else _pretty."""
+        return _pretty(self.labels.get(str(name), name))
 
     # ---- internals ---------------------------------------------------------
     def _extract_forests(self):
@@ -283,7 +291,7 @@ class Screener:
                 continue
             if v < lo or v > hi:
                 flags.append(
-                    f"{_pretty(c)} = {v:g} is outside the observed range "
+                    f"{self.pretty(c)} = {v:g} is outside the observed range "
                     f"[{lo:g}, {hi:g}] — extrapolation.")
         for c, choices in self.categorical_schema.items():
             v = raw.get(c)
@@ -291,7 +299,7 @@ class Screener:
                 continue
             sv = str(v)
             if sv not in choices and sv.strip().lower() not in BLANK_TOKENS:
-                flags.append(f"{_pretty(c)} = '{sv}' was never seen in training "
+                flags.append(f"{self.pretty(c)} = '{sv}' was never seen in training "
                              f"— unknown category.")
         return flags
 
@@ -305,7 +313,7 @@ class Screener:
         for c in self.categorical_schema:
             v = str(raw.get(c, "Missing")).strip().lower()
             if v in UNKNOWN_TOKENS:
-                missing.append(_pretty(c))
+                missing.append(self.pretty(c))
         return missing
 
     # ---- 3. similar experiments -------------------------------------------
@@ -425,15 +433,15 @@ class Screener:
                 tol = max(1e-9, 0.03 * max(abs(v) for v in yvals))
                 if delta > tol:
                     direction = "increase"
-                    text = (f"Increasing {_pretty(feature)} tends to increase "
-                            f"predicted {_pretty(target)}.")
+                    text = (f"Increasing {self.pretty(feature)} tends to increase "
+                            f"predicted {self.pretty(target)}.")
                 elif delta < -tol:
                     direction = "decrease"
-                    text = (f"Increasing {_pretty(feature)} tends to decrease "
-                            f"predicted {_pretty(target)}.")
+                    text = (f"Increasing {self.pretty(feature)} tends to decrease "
+                            f"predicted {self.pretty(target)}.")
                 else:
                     direction = "flat"
-                    text = (f"{_pretty(feature)} has little directional effect "
+                    text = (f"{self.pretty(feature)} has little directional effect "
                             f"across the observed range.")
                 effects.append({
                     "feature": feature, "kind": "numeric", "direction": direction,
@@ -450,8 +458,8 @@ class Screener:
                     "direction": "level_choice", "swing": float(swing),
                     "best_level": xs[best], "best_prediction": yvals[best],
                     "worst_level": xs[worst], "worst_prediction": yvals[worst],
-                    "summary": (f"For {_pretty(feature)}, '{xs[best]}' gives the "
-                                f"highest predicted {_pretty(target)} among known "
+                    "summary": (f"For {self.pretty(feature)}, '{xs[best]}' gives the "
+                                f"highest predicted {self.pretty(target)} among known "
                                 f"training levels; '{xs[worst]}' gives the lowest."),
                 })
         return {"sensitivity": sensitive, "effects": effects,
@@ -494,13 +502,13 @@ class Screener:
 
         reasons = []
         if perf >= 0.75:
-            reasons.append(f"High predicted {_pretty(target)} — better than "
+            reasons.append(f"High predicted {self.pretty(target)} — better than "
                            f"{rank['percentile']:.0f}% of experiments in the dataset.")
         elif perf >= 0.5:
-            reasons.append(f"Above-median predicted {_pretty(target)} "
+            reasons.append(f"Above-median predicted {self.pretty(target)} "
                            f"({rank['percentile']:.0f}th percentile of the dataset).")
         else:
-            reasons.append(f"Modest predicted {_pretty(target)} "
+            reasons.append(f"Modest predicted {self.pretty(target)} "
                            f"({rank['percentile']:.0f}th percentile of the dataset).")
 
         if conf_label == "High":
