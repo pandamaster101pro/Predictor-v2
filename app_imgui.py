@@ -241,7 +241,9 @@ def auto_detect_columns(path, sheet=None):
     known = ["100_1A", "100_0p1A", "100_10mA", "500_1A", "500_0p1A", "500_10mA"]
     targets = [c for c in known if c in cols]
     if not targets:
-        tpat = re.compile(r"^\d+_\d+p?\d*(a|ma)$", re.I)
+        # Rate-style performance columns: '100_1A', 'LIB_1A', 'SIB_0_1A',
+        # 'LIB_30mA', ... — any name ending in _<num>[p<num>]A / mA.
+        tpat = re.compile(r"^\S+_\d+p?\d*\s*(a|ma)$", re.I)
         targets = [c for c in cols
                    if tpat.match(c) and pd.api.types.is_numeric_dtype(df[c])]
 
@@ -252,8 +254,11 @@ def auto_detect_columns(path, sheet=None):
             if df[c].dtype == object:
                 uniq_ratio = df[c].nunique(dropna=True) / n
                 name_hint = "serial" in c.lower() or c.lower() in {"id", "index"} \
-                    or c.lower().endswith("_id")
-                if uniq_ratio > 0.9 and (name_hint or uniq_ratio >= 0.98):
+                    or c.lower().endswith("_id") \
+                    or "批號" in c or "編號" in c or "batch" in c.lower()
+                # A hinted name is an id even with replicates (rows sharing a
+                # serial); without a hint require near-total uniqueness.
+                if (name_hint and uniq_ratio > 0.2) or uniq_ratio >= 0.98:
                     ids.append(c)
 
     # --- messy/mixed columns (there may be several) ---
@@ -407,17 +412,22 @@ def build_Xy(cfg, notes=None):
     # Standardize measurement units per column BEFORE numeric coercion, so cells
     # like "2 h" become 120 (minutes) and a "(K)" temperature column becomes °C.
     # Targets (labels) and manually-typed columns are protected from conversion.
-    df = units.standardize_units(
-        df,
-        protected=set(cfg["targets"]) | set(cfg.get("col_types", {}).keys()),
-        notes=notes,
-    )
-    # The messy-column parser splits concentrations like '3.2%V H2SO4' into a
-    # number plus label columns ('<col>: code' / '<col>: detail').  Rebuild
-    # molarity from those parts and drop the label columns — their information
-    # now lives in the standardized number.
-    df = units.standardize_parsed_mixed(
-        df, notes=notes, labels=mixed_feature_labels(cfg["mixed"]))
+    # Optional: governed by the "Auto-standardize units" checkbox on the Train
+    # tab — when off, values are used exactly as they appear in the sheet.
+    if cfg.get("standardize_units", True):
+        df = units.standardize_units(
+            df,
+            protected=set(cfg["targets"]) | set(cfg.get("col_types", {}).keys()),
+            notes=notes,
+        )
+        # The messy-column parser splits concentrations like '3.2%V H2SO4' into
+        # a number plus label columns ('<col>: code' / '<col>: detail').  Rebuild
+        # molarity from those parts and drop the label columns — their
+        # information now lives in the standardized number.
+        df = units.standardize_parsed_mixed(
+            df, notes=notes, labels=mixed_feature_labels(cfg["mixed"]))
+    else:
+        log("Unit standardization is OFF — values used exactly as in the sheet.")
     # Auto-fix columns that are numeric except for a stray text marker, so a real
     # temperature/time column isn't mistaken for a categorical. Manual choices win.
     df = auto_coerce_numeric(df, protected=set(cfg.get("col_types", {}).keys()))
@@ -436,6 +446,11 @@ def build_Xy(cfg, notes=None):
         df = df.drop(columns=empty)
 
     targets = cfg["targets"]
+    if not targets:
+        raise ValueError(
+            "No target column selected. Type the target column name(s) in the "
+            "Train tab (step 2), or set a Target role in the Column types tab. "
+            f"Available columns: {', '.join(str(c) for c in df.columns[:20])}…")
     missing = [c for c in targets if c not in df.columns]
     if missing:
         raise ValueError(f"Target columns not found: {missing}")
@@ -784,6 +799,11 @@ class AppState:
         self.batch_error = ""
         self.batch_results = None
 
+        # Auto-standardize measurement units during preprocessing (Train tab
+        # checkbox): '2 h' -> 120 min, K -> C, '3.2%V H2SO4' -> mol/L, and
+        # parsed messy-column label removal. Off = data used exactly as-is.
+        self.standardize_units = True
+
         # --- Column-types tab (manual numeric/categorical overrides + roles) ---
         self.coltype_columns = []          # ordered list of column names scanned
         self.coltype_map = {}              # {col: "numeric" | "categorical"}
@@ -1087,6 +1107,7 @@ def start_training():
         col_types=dict(STATE.coltype_map),       # manual numeric/categorical overrides
         exclude=_split_cols(STATE.exclude_columns),  # cols dropped from training
         sheet=_current_sheet(),                  # selected worksheet/tab
+        standardize_units=STATE.standardize_units,   # Train-tab checkbox
     )
     threading.Thread(target=_train_worker, args=(cfg,), daemon=True).start()
 
@@ -1214,6 +1235,7 @@ def start_comparison():
         col_types=dict(STATE.coltype_map),       # manual numeric/categorical overrides
         exclude=_split_cols(STATE.exclude_columns),  # cols dropped from training
         sheet=_current_sheet(),                  # selected worksheet/tab
+        standardize_units=STATE.standardize_units,   # Train-tab checkbox
     )
     threading.Thread(target=_compare_worker, args=(cfg,), daemon=True).start()
 
@@ -1387,6 +1409,7 @@ def start_charts():
         col_types=dict(STATE.coltype_map),
         exclude=_split_cols(STATE.exclude_columns),
         sheet=_current_sheet(),                  # selected worksheet/tab
+        standardize_units=STATE.standardize_units,   # Train-tab checkbox
     )
     numeric_feats = list(STATE.numeric_schema.keys())
 
@@ -2232,6 +2255,12 @@ def draw_train_tab():
     _, STATE.id_columns = imgui.input_text("ID columns to drop (comma-sep)", STATE.id_columns)
     imgui.set_next_item_width(360)
     _, STATE.target_columns = imgui.input_text("Target columns (comma-sep)", STATE.target_columns)
+
+    _, STATE.standardize_units = imgui.checkbox(
+        "Auto-standardize units", STATE.standardize_units)
+    imgui.same_line()
+    imgui.text_colored(DIM, "'2 h' -> 120 min, K -> C, '3.2%V H2SO4' -> mol/L; "
+                            "off = use values exactly as in the sheet")
 
     imgui.dummy(imgui.ImVec2(0, 6))
     imgui.text("3) Train")
