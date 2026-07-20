@@ -16,6 +16,7 @@ import tempfile
 import pandas as pd
 
 import charts as C
+import units
 
 
 # =============================================================================
@@ -178,8 +179,8 @@ def build_prediction_pdf(path, result, screener, model_summary=""):
     # --- Input conditions ---
     story.append(Paragraph("Input synthesis conditions", h2))
     rows = [["Variable", "Value"]]
-    for c, v in result["raw"].items():
-        rows.append([screener.pretty(c), _fmt(v)])
+    for name, v in units.compose_grouped(result["raw"], screener.labels):
+        rows.append([name, _fmt(v)])
     it = Table(rows, colWidths=[85 * mm, 85 * mm])
     it.setStyle(_grid_style(colors))
     story.append(it)
@@ -296,8 +297,9 @@ def export_prediction_excel(path, result, screener):
                   result["applicability"]["in_domain"],
                   mq["cv_r2"], mq["n_train"], mq["n_features"]],
     })
-    inputs = pd.DataFrame({"Variable": list(result["raw"].keys()),
-                           "Value": [_fmt(v) for v in result["raw"].values()]})
+    grouped = units.compose_grouped(result["raw"], screener.labels)
+    inputs = pd.DataFrame({"Variable": [n for n, _ in grouped],
+                           "Value": [_fmt(v) for _, v in grouped]})
     reasons = pd.DataFrame({"Recommendation reasons": rec["reasons"]})
     warnings = pd.DataFrame({"Warnings": (result["ood"] +
                              (["Unspecified: " + ", ".join(result["missing"])]

@@ -193,8 +193,9 @@ def test_parsed_triple_vv_to_molarity_and_labels_removed():
     out = U.standardize_parsed_mixed(df, notes=notes)
     h2so4 = U.CHEMICALS["h2so4"]
     f = 10 * h2so4["pure_density_g_ml"] / h2so4["molar_mass_g_mol"]
-    assert list(out.columns) == ["numeric_feature_A1"]
+    assert set(out.columns) == {"numeric_feature_A1", "solute_label_D1"}
     assert _col(out, "numeric_feature_A1") == pytest.approx([3.2 * f, 1.6 * f, 0.0])
+    assert _col(out, "solute_label_D1") == ["H2SO4", "H2SO4", "None"]
     assert notes and "removed its label columns" in notes[0]
 
 
@@ -206,8 +207,9 @@ def test_parsed_triple_molar_code_passthrough():
         "text_modifier_C": ["koh", "koh", "None"],
     })
     out = U.standardize_parsed_mixed(df)
-    assert list(out.columns) == ["numeric_feature_A"]
+    assert set(out.columns) == {"numeric_feature_A", "solute_label_D"}
     assert _col(out, "numeric_feature_A") == pytest.approx([1.0, 0.5, 0.0])
+    assert _col(out, "solute_label_D") == ["KOH", "KOH", "None"]
 
 
 def test_parsed_triple_wv_basis_split_across_labels():
@@ -219,9 +221,10 @@ def test_parsed_triple_wv_basis_split_across_labels():
     })
     out = U.standardize_parsed_mixed(df)
     nahco3 = U.CHEMICALS["nahco3"]
-    assert list(out.columns) == ["numeric_feature_A"]
+    assert set(out.columns) == {"numeric_feature_A", "solute_label_D"}
     assert _col(out, "numeric_feature_A") == pytest.approx(
         [10 * 0.2 / nahco3["molar_mass_g_mol"], 10 * 2.0 / nahco3["molar_mass_g_mol"]])
+    assert _col(out, "solute_label_D") == ["NaHCO3", "NaHCO3"]
 
 
 def test_parsed_triple_doping_keeps_labels():
@@ -248,6 +251,49 @@ def test_parsed_triple_below_threshold_untouched():
     assert set(out.columns) == {"numeric_feature_A", "group_label_B",
                                 "text_modifier_C"}
     assert _col(out, "numeric_feature_A") == [3.2, 10.0, 1.0]
+
+
+# ---------------------------------------------------------------------------
+# Display composition ('1M NaOH' instead of split internal columns)
+# ---------------------------------------------------------------------------
+def test_compose_value_molarity_with_solute():
+    assert U.compose_value(1.0, solute="NaOH") == "1M NaOH"
+    assert U.compose_value(0.5972, solute="H2SO4") == "0.5972M H2SO4"
+    assert U.compose_value(0.0, solute="None") == "--"
+    assert U.compose_value(0.3, solute="Missing") == "0.3 M"
+
+
+def test_compose_value_unconverted_triple():
+    assert U.compose_value(15.0, code="MN") == "15% MN"
+    assert U.compose_value(5.0, code="ZN", detail="znso4-7h2o") == "5% ZN (znso4-7h2o)"
+    assert U.compose_value(0.0, detail="bio oil") == "bio oil"
+    assert U.compose_value(0.0, code="None", detail="None") == "--"
+
+
+def test_recipe_groups_and_compose_group():
+    cols = ["numeric_feature_A1", "solute_label_D1",
+            "numeric_feature_A2", "group_label_B2", "text_modifier_C2",
+            "numeric_feature_A3", "Temp_C"]
+    groups = U.recipe_groups(cols)
+    assert set(groups) == {"1", "2"}          # A3 has no companions -> no group
+    row = {"numeric_feature_A1": 1.0, "solute_label_D1": "NaOH",
+           "numeric_feature_A2": 15.0, "group_label_B2": "MN",
+           "text_modifier_C2": "None"}
+    assert U.compose_group(groups["1"], row.get) == "1M NaOH"
+    assert U.compose_group(groups["2"], row.get) == "15% MN"
+
+
+def test_compose_grouped_passthrough_and_labels():
+    raw = {"numeric_feature_A1": 1.0, "solute_label_D1": "NaOH", "Temp_C": 900}
+    labels = {"numeric_feature_A1": "Pretreat 1: number/percent"}
+    rows = dict(U.compose_grouped(raw, labels))
+    assert rows == {"Pretreat 1": "1M NaOH", "Temp_C": 900}
+
+
+def test_roundtrip_cell_to_parts_to_display():
+    # '1M NaOH' -> parse -> molarity + solute -> compose -> '1M NaOH'
+    mol, solute, basis = U.parse_concentration_to_molarity("1M NaOH")
+    assert U.compose_value(mol, solute=solute) == "1M NaOH"
 
 
 if __name__ == "__main__":

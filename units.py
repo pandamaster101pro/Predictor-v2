@@ -482,10 +482,13 @@ def standardize_parsed_mixed(df: pd.DataFrame, notes: list | None = None,
 
     Runs after :func:`standardize_units`.  For every triple whose label columns
     give an unambiguous basis + chemical for at least 70% of the informative
-    rows (and at least 2 rows), the numeric column is rewritten as mol/L and
-    both label columns are removed.  'Not-done' rows (labels blank/'None')
-    keep their 0.0.  Triples that don't look like concentrations — dopants,
-    plain amounts, unknown chemicals — are left untouched, labels included.
+    rows (and at least 2 rows), the numeric column is rewritten as mol/L, the
+    solute identity is kept as one categorical ``solute_label_D*`` column
+    (NaOH/KOH/... ; 'None' for not-done rows, 'Missing' when unknown), and the
+    raw label columns are removed — so '1M NaOH' round-trips as 1.0 + 'NaOH'.
+    'Not-done' rows (labels blank/'None') keep their 0.0.  Triples that don't
+    look like concentrations — dopants, plain amounts, unknown chemicals — are
+    left untouched, labels included.
 
     ``labels`` optionally maps internal column names to display names for the
     ``notes`` messages.
@@ -499,38 +502,142 @@ def standardize_parsed_mixed(df: pd.DataFrame, notes: list | None = None,
             continue
         b_col = f"group_label_B{m.group(1)}"
         c_col = f"text_modifier_C{m.group(1)}"
+        d_col = f"solute_label_D{m.group(1)}"
         if b_col not in out.columns or c_col not in out.columns:
             continue
 
-        new_vals, n_informative, n_conv = [], 0, 0
+        new_vals, new_solutes, n_informative, n_conv = [], [], 0, 0
         solutes = set()
         for amt, code, txt in zip(out[a_col], out[b_col], out[c_col]):
             code_blank = _is_blank(code) or str(code).strip().lower() == "none"
             txt_blank = _is_blank(txt) or str(txt).strip().lower() == "none"
             if code_blank and txt_blank:
                 new_vals.append(amt)          # 'not done' -> stays 0.0
+                new_solutes.append("None")
                 continue
             n_informative += 1
             mol = molarity_from_parts(amt, code, txt)
             if mol is None:
                 new_vals.append(amt)
+                new_solutes.append("Missing")
             else:
                 new_vals.append(mol)
                 n_conv += 1
                 chem = _find_chemical(txt)
+                label = chem["label"] if chem else "Missing"
+                new_solutes.append(label)
                 if chem is not None:
-                    solutes.add(chem["label"])
+                    solutes.add(label)
 
         if n_conv < 2 or n_informative == 0 or n_conv / n_informative < 0.7:
             continue
         out[a_col] = pd.Series(new_vals, index=out.index, dtype=float)
+        out[d_col] = pd.Series(new_solutes, index=out.index, dtype=object)
         out = out.drop(columns=[b_col, c_col])
         if notes is not None:
             solute_desc = ", ".join(sorted(solutes)) or "?"
             notes.append(f"Standardized '{labels.get(a_col, a_col)}' to molarity "
-                         f"(M; {solute_desc}) and removed its label columns "
+                         f"(M; {solute_desc}), kept the chemical as "
+                         f"'{labels.get(d_col, d_col)}', and removed its label columns "
                          f"'{labels.get(b_col, b_col)}' and '{labels.get(c_col, c_col)}'.")
     return out
+
+
+# =============================================================================
+# Display helpers  —  show '1M NaOH' instead of the internal split columns
+# =============================================================================
+_PART_PREFIXES = (("A", "numeric_feature_A"), ("B", "group_label_B"),
+                  ("C", "text_modifier_C"), ("D", "solute_label_D"))
+
+
+def _meaningful(v) -> bool:
+    return not (_is_blank(v) or str(v).strip().lower() in ("none", "missing"))
+
+
+def recipe_groups(columns) -> dict:
+    """Detect parsed messy-column groups among ``columns``.
+
+    Returns ``{suffix: {"A": col, "B": col?, "C": col?, "D": col?}}`` for every
+    numeric_feature_A* that has at least one companion label/solute column.
+    """
+    cols = {str(c) for c in columns}
+    groups = {}
+    for c in cols:
+        m = _TRIPLE_A_RE.match(c)
+        if m is None:
+            continue
+        s = m.group(1)
+        g = {"A": c}
+        for key, pre in _PART_PREFIXES[1:]:
+            if f"{pre}{s}" in cols:
+                g[key] = f"{pre}{s}"
+        if len(g) > 1:
+            groups[s] = g
+    return groups
+
+
+def compose_value(amount, solute=None, code=None, detail=None) -> str:
+    """One human-readable value from the parsed parts.
+
+    (1.0, 'NaOH')          -> '1M NaOH'         (converted concentration)
+    (15.0, None, 'MN')     -> '15% MN'          (unconverted triple, dopant)
+    (0.0, 'None')          -> '--'              (step not performed)
+    (5.0, None, 'ZN', 'znso4-7h2o') -> '5% ZN (znso4-7h2o)'
+    """
+    try:
+        amt = float(amount)
+    except (TypeError, ValueError):
+        amt = 0.0
+    if solute is not None:                       # molarity + chemical identity
+        s = str(solute).strip()
+        if s.lower() == "none" and amt == 0:
+            return "--"
+        if _meaningful(s):
+            return f"{amt:.4g}M {s}"
+        return f"{amt:.4g} M"
+    has_code, has_detail = _meaningful(code), _meaningful(detail)
+    if has_code:
+        base = f"{amt:.4g}% {str(code).strip()}"
+        return f"{base} ({str(detail).strip()})" if has_detail else base
+    if has_detail:
+        return str(detail).strip() if amt == 0 else f"{amt:.4g} {str(detail).strip()}"
+    return "--" if amt == 0 else f"{amt:.4g}"
+
+
+def compose_group(group: dict, getval) -> str:
+    """Compose the display value for one recipe group via ``getval(col)``."""
+    return compose_value(
+        getval(group["A"]),
+        solute=(getval(group["D"]) if "D" in group else None),
+        code=(getval(group["B"]) if "B" in group else None),
+        detail=(getval(group["C"]) if "C" in group else None))
+
+
+def compose_grouped(raw: dict, labels: dict | None = None) -> list:
+    """Collapse the parsed-part entries of a raw {col: value} dict for display.
+
+    Returns ``[(display_name, display_value), ...]`` where each recipe group
+    becomes one row (named after its source column, e.g. 'Pretreat 1') showing
+    e.g. '1M NaOH'; every other key passes through (display-labelled when a
+    label exists).
+    """
+    labels = dict(labels or {})
+    groups = recipe_groups(raw.keys())
+    member = {col: s for s, g in groups.items() for col in g.values()}
+    done, rows = set(), []
+    for key, val in raw.items():
+        s = member.get(str(key))
+        if s is None:
+            rows.append((labels.get(str(key), str(key)), val))
+            continue
+        if s in done:
+            continue
+        done.add(s)
+        g = groups[s]
+        base = labels.get(g["A"], g["A"])
+        base = base.rsplit(":", 1)[0].strip() if ":" in base else base
+        rows.append((base, compose_group(g, lambda c: raw.get(c))))
+    return rows
 
 
 def _convert(value: float, dim: str, src_norm: str, target_norm: str) -> float:

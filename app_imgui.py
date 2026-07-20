@@ -316,6 +316,10 @@ def mixed_feature_labels(mixed, columns=None):
         labels[amount] = f"{col}: number/percent"
         labels[code] = f"{col}: code"
         labels[modifier] = f"{col}: detail"
+        # Chemical-identity column emitted when the triple is converted to
+        # molarity (units.standardize_parsed_mixed). Same suffix scheme.
+        suffix = amount[len("numeric_feature_A"):]
+        labels[f"solute_label_D{suffix}"] = f"{col}: chemical"
     return labels
 
 
@@ -332,6 +336,87 @@ def feature_label(col):
 def pretty(col):
     """Human-friendly label for any feature/target name shown in the UI."""
     return screening._pretty(feature_label(col))
+
+
+def group_base_label(group):
+    """Original column name a recipe group came from ('Pretreat 1')."""
+    lab = feature_label(group["A"])
+    return lab.rsplit(":", 1)[0].strip() if ":" in lab else lab
+
+
+def _set_widget_categorical(col, value):
+    """Point a categorical widget at ``value`` (custom text when unseen)."""
+    choices = STATE.categorical_schema.get(col, [])
+    value = str(value)
+    if value in choices:
+        STATE.category_index[col] = choices.index(value)
+        STATE.screen_custom_category[col] = ""
+    else:
+        STATE.screen_custom_category[col] = value
+
+
+def apply_recipe_text(group, text):
+    """Parse one typed recipe value ('1M NaOH', '3.2%V H2SO4', '15% Mn', '--')
+    back into the group's internal widget values."""
+    text = str(text).strip()
+    if not text or units._is_blank(text):        # step not performed
+        STATE.numeric_values[group["A"]] = 0.0
+        for k in ("B", "C", "D"):
+            if k in group:
+                _set_widget_categorical(group[k], "None")
+        return
+    conc = units.parse_concentration_to_molarity(text)
+    if conc is not None and "D" in group:
+        molarity, solute, _basis = conc
+        STATE.numeric_values[group["A"]] = float(molarity)
+        _set_widget_categorical(group["D"], solute)
+        return
+    amount, code, detail = parse_mixed_value(text)
+    STATE.numeric_values[group["A"]] = float(amount)
+    if "B" in group:
+        _set_widget_categorical(group["B"], code)
+    if "C" in group:
+        _set_widget_categorical(group["C"], detail)
+    if "D" in group:
+        chem = units._find_chemical(detail, code)
+        _set_widget_categorical(group["D"], chem["label"] if chem else "Missing")
+
+
+def _widget_cat_value(col):
+    custom = STATE.screen_custom_category.get(col, "").strip()
+    if custom:
+        return custom
+    choices = STATE.categorical_schema.get(col, [])
+    idx = min(STATE.category_index.get(col, 0), max(len(choices) - 1, 0))
+    return choices[idx] if choices else "None"
+
+
+def draw_recipe_inputs(id_prefix, mark_dirty=False):
+    """One combined text input per parsed messy column ('1M NaOH' style).
+
+    Returns the set of internal columns consumed, so callers skip their
+    individual widgets.
+    """
+    groups = units.recipe_groups(set(STATE.numeric_schema) | set(STATE.categorical_schema))
+    consumed = set()
+    for s in sorted(groups):
+        g = groups[s]
+        consumed.update(g.values())
+        key = f"{id_prefix}{s}"
+        cur = STATE.mixed_text.get(key)
+        if cur is None:
+            cur = units.compose_group(
+                g, lambda c: STATE.numeric_values.get(c, STATE.numeric_schema.get(c))
+                if c in STATE.numeric_schema else _widget_cat_value(c))
+            STATE.mixed_text[key] = cur
+        imgui.set_next_item_width(360)
+        changed, txt = imgui.input_text(f"{group_base_label(g)}##recipe_{key}", cur)
+        if changed:
+            STATE.mixed_text[key] = txt
+            apply_recipe_text(g, txt)
+            if mark_dirty:
+                STATE.screen_dirty = True
+    return consumed
 
 
 def prepare_raw(df, ids, mixed):
@@ -806,6 +891,7 @@ class AppState:
         self.numeric_values = {}           # {col: float}
         self.category_index = {}           # {col: chosen index}
         self.feature_labels = {}           # {internal col: display label}
+        self.mixed_text = {}               # {widget key: '1M NaOH' style text}
         self.single_pred = None            # [(target, value), ...]
         self.predict_error = ""
 
@@ -1218,6 +1304,7 @@ def _train_worker(cfg):
         STATE.numeric_values = dict(numeric_schema)
         STATE.category_index = {c: 0 for c in categorical_schema}
         STATE.screen_custom_category = {c: "" for c in categorical_schema}
+        STATE.mixed_text = {}              # recompose '1M NaOH' texts from defaults
         STATE.single_pred = None
         STATE.predict_error = ""
 
@@ -1969,7 +2056,10 @@ def predict_single():
     STATE.predict_error = ""
     row = dict(STATE.numeric_values)
     for col, choices in STATE.categorical_schema.items():
-        row[col] = choices[STATE.category_index[col]]
+        # A '1M NaOH'-style recipe field may have typed a level unseen in
+        # training; it lives in screen_custom_category and wins over the combo.
+        custom = STATE.screen_custom_category.get(col, "").strip()
+        row[col] = custom or choices[STATE.category_index[col]]
     try:
         X_raw = pd.DataFrame([row])
         preds = STATE.model.predict(build_matrix(X_raw))[0]
@@ -2074,6 +2164,7 @@ def load_model():
     STATE.numeric_values = dict(STATE.numeric_schema)
     STATE.category_index = {c: 0 for c in STATE.categorical_schema}
     STATE.screen_custom_category = {c: "" for c in STATE.categorical_schema}
+    STATE.mixed_text = {}
     STATE.trained = True
     rebuild_screener()
     STATE.status = f"Loaded model from '{MODEL_OUT}'."
@@ -2113,6 +2204,7 @@ def _apply_screen_recipe(raw):
         else:
             STATE.category_index[col] = STATE.category_index.get(col, 0)
             STATE.screen_custom_category[col] = value
+    STATE.mixed_text = {}                  # recompose '1M NaOH' texts from the recipe
     STATE.screen_dirty = True
 
 
@@ -2347,12 +2439,18 @@ def draw_predict_tab():
     imgui.separator()
 
     if imgui.begin_child("inputs", imgui.ImVec2(0, 300)):
+        # Parsed messy columns appear as ONE field each ('1M NaOH' style).
+        consumed = draw_recipe_inputs("pred")
         for col in STATE.numeric_schema:
+            if col in consumed:
+                continue
             changed, val = imgui.input_float(f"{feature_label(col)}##num_{col}",
                                              float(STATE.numeric_values[col]))
             if changed:
                 STATE.numeric_values[col] = val
         for col, choices in STATE.categorical_schema.items():
+            if col in consumed:
+                continue
             changed, idx = imgui.combo(f"{feature_label(col)}##cat_{col}",
                                        STATE.category_index[col], choices)
             if changed:
@@ -3163,13 +3261,19 @@ def _screen_inputs_panel():
     imgui.same_line()
     imgui.text_colored(DIM, "(edit to run a what-if)")
     if imgui.begin_child("screen_inputs", imgui.ImVec2(0, 0)):
+        # Parsed messy columns appear as ONE field each ('1M NaOH' style).
+        consumed = draw_recipe_inputs("scr", mark_dirty=True)
         for col in STATE.numeric_schema:
+            if col in consumed:
+                continue
             changed, val = imgui.input_float(f"{feature_label(col)}##snum_{col}",
                                              float(STATE.numeric_values[col]))
             if changed:
                 STATE.numeric_values[col] = val
                 STATE.screen_dirty = True
         for col, choices in STATE.categorical_schema.items():
+            if col in consumed:
+                continue
             STATE.category_index[col] = min(STATE.category_index.get(col, 0),
                                             max(len(choices) - 1, 0))
             changed, idx = imgui.combo(f"{feature_label(col)}##scat_{col}",
@@ -3192,15 +3296,31 @@ def _draw_similar_table(res, scr):
     sims = res["similar"]
     if not sims:
         return
-    # Show the most influential synthesis variables as context columns.
-    disp = [f for f, _ in scr.importance[:4] if f in sims[0]["conditions"]]
+    # Show the most influential synthesis variables as context columns; the
+    # parts of a parsed messy column collapse into ONE '1M NaOH'-style column.
+    cond_cols = set(sims[0]["conditions"])
+    groups = units.recipe_groups(cond_cols)
+    member = {col: s for s, g in groups.items() for col in g.values()}
+    disp, seen = [], set()
+    for f, _ in scr.importance:
+        if f not in cond_cols:
+            continue
+        gs = member.get(f)
+        if gs is not None:
+            if gs not in seen:
+                seen.add(gs)
+                disp.append(("group", groups[gs]))
+        else:
+            disp.append(("col", f))
+        if len(disp) == 4:
+            break
     flags = imgui.TableFlags_.borders | imgui.TableFlags_.row_bg
     ncol = 2 + len(disp)
     if imgui.begin_table("sim", ncol, flags):
         imgui.table_setup_column("Similar")
         imgui.table_setup_column("Measured")
-        for d in disp:
-            imgui.table_setup_column(pretty(d))
+        for kind, d in disp:
+            imgui.table_setup_column(group_base_label(d) if kind == "group" else pretty(d))
         imgui.table_headers_row()
         for s in sims:
             imgui.table_next_row()
@@ -3210,10 +3330,13 @@ def _draw_similar_table(res, scr):
                                f"{sim:.0f}%")
             imgui.table_next_column()
             imgui.text(f"{s['measured'][target]:.1f}")
-            for d in disp:
+            for kind, d in disp:
                 imgui.table_next_column()
-                v = s["conditions"][d]
-                imgui.text(f"{v:g}" if isinstance(v, float) else str(v)[:16])
+                if kind == "group":
+                    imgui.text(units.compose_group(d, s["conditions"].get)[:20])
+                else:
+                    v = s["conditions"][d]
+                    imgui.text(f"{v:g}" if isinstance(v, float) else str(v)[:16])
         imgui.end_table()
 
 
