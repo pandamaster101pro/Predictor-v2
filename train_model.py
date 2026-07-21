@@ -70,6 +70,7 @@ from sklearn.ensemble import ExtraTreesRegressor
 from sklearn.multioutput import MultiOutputRegressor
 from sklearn.preprocessing import RobustScaler
 from sklearn.metrics import r2_score
+import chemistry_features as chemistry
 
 
 # =============================================================================
@@ -233,7 +234,8 @@ def run_extratrees(X, y):
 
     print("\nTop 5 most influential features:")
     for rank, (feat, imp) in enumerate(top.head(5).items(), start=1):
-        print(f"  {rank}. {feat:<30} {imp * 100:6.2f}%")
+        shown = chemistry.descriptor_display_name(str(feat))
+        print(f"  {rank}. {shown:<30} {imp * 100:6.2f}%")
 
     return avg_r2
 
@@ -324,6 +326,13 @@ def main(data_path):
     feature_cols = [c for c in df.columns if c not in TARGET_COLUMNS]
     X = df[feature_cols].copy()
     y = df[TARGET_COLUMNS].copy()
+    chemistry_expansion = chemistry.ENGINE.transform(
+        X, include_original=False, add_interactions=True)
+    X = chemistry_expansion.frame
+    if chemistry_expansion.metadata.get("columns"):
+        print(f"      Chemistry engine: expanded "
+              f"{len(chemistry_expansion.metadata['columns'])} chemical column(s) into "
+              f"{chemistry_expansion.metadata['descriptor_feature_count']} descriptors.")
 
     # 3b. FEATURE SELECTION — prune columns that add noise instead of signal:
     #       * too sparse:      missing in more than MAX_MISSING_FRAC of the rows.

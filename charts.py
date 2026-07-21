@@ -197,7 +197,9 @@ def correlation_heatmap(df, out, columns=None, title="Correlation heatmap",
                     pvals[i, j] = 0.0
                     continue
                 xy = num[[a, b]].dropna()
-                if len(xy) < 4:
+                # A constant column has no defined correlation p-value; leave it
+                # at 1.0 (not significant) instead of warning + returning NaN.
+                if len(xy) < 4 or xy[a].nunique() < 2 or xy[b].nunique() < 2:
                     continue
                 if method == "spearman":
                     _, p = _st.spearmanr(xy[a], xy[b])
@@ -235,14 +237,15 @@ def correlation_heatmap(df, out, columns=None, title="Correlation heatmap",
 
 
 # =============================================================================
-# 2. PREDICTED vs ACTUAL   /   3. RESIDUAL PLOT   (one panel per target)
+# 2. PREDICTED vs ACTUAL   /   3. RESIDUAL PLOT   (one pane l per target)
 # =============================================================================
 def _as2d(a):
     a = np.asarray(a, dtype=float)
     return a.reshape(-1, 1) if a.ndim == 1 else a
 
 
-def predicted_vs_actual(y_true, y_pred, target_names, out, r2_by_target=None):
+def predicted_vs_actual(y_true, y_pred, target_names, out, r2_by_target=None,
+                        validation_method="cross-validation"):
     y_true, y_pred = _as2d(y_true), _as2d(y_pred)
     k = y_true.shape[1]
     names = list(target_names) if target_names is not None else [f"target {i}" for i in range(k)]
@@ -252,7 +255,7 @@ def predicted_vs_actual(y_true, y_pred, target_names, out, r2_by_target=None):
     rows, cols = _grid_shape(k)
     fig, axes = plt.subplots(rows, cols, figsize=(4.6 * cols, 4.0 * rows), facecolor=SURF)
     axes = np.atleast_1d(axes).ravel()
-    fig.suptitle("Actual vs Predicted Performance (out-of-fold)", color=INK, fontsize=13,
+    fig.suptitle(f"Predicted vs Actual - {validation_method} (pooled OOF)", color=INK, fontsize=13,
                  fontweight="bold", x=0.02, ha="left")
     interpretations = []
     for i in range(k):
@@ -308,7 +311,8 @@ def predicted_vs_actual(y_true, y_pred, target_names, out, r2_by_target=None):
     return _save(fig, out, title="Actual vs predicted", interpretation=interp)
 
 
-def residual_plot(y_true, y_pred, target_names, out):
+def residual_plot(y_true, y_pred, target_names, out,
+                  validation_method="cross-validation"):
     y_true, y_pred = _as2d(y_true), _as2d(y_pred)
     k = y_true.shape[1]
     names = list(target_names) if target_names is not None else [f"target {i}" for i in range(k)]
@@ -318,7 +322,7 @@ def residual_plot(y_true, y_pred, target_names, out):
     rows, cols = _grid_shape(k)
     fig, axes = plt.subplots(rows, cols, figsize=(4.6 * cols, 4.0 * rows), facecolor=SURF)
     axes = np.atleast_1d(axes).ravel()
-    fig.suptitle("Residual Diagnostics (out-of-fold)", color=INK, fontsize=13,
+    fig.suptitle(f"Residual Diagnostics - {validation_method} (pooled OOF)", color=INK, fontsize=13,
                  fontweight="bold", x=0.02, ha="left")
     summaries = []
     for i in range(k):
@@ -356,7 +360,8 @@ def residual_plot(y_true, y_pred, target_names, out):
     return _save(fig, out, title="Residual diagnostics", interpretation=interp)
 
 
-def residual_distribution(y_true, y_pred, target_names, out):
+def residual_distribution(y_true, y_pred, target_names, out,
+                          validation_method="cross-validation"):
     """Residual histograms/error distributions for one or more targets."""
     y_true, y_pred = _as2d(y_true), _as2d(y_pred)
     k = y_true.shape[1]
@@ -366,7 +371,7 @@ def residual_distribution(y_true, y_pred, target_names, out):
     rows, cols = _grid_shape(k)
     fig, axes = plt.subplots(rows, cols, figsize=(4.8 * cols, 3.8 * rows), facecolor=SURF)
     axes = np.atleast_1d(axes).ravel()
-    fig.suptitle("Prediction Error Distribution", color=INK, fontsize=13,
+    fig.suptitle(f"Residual Distribution - {validation_method} (pooled OOF)", color=INK, fontsize=13,
                  fontweight="bold", x=0.02, ha="left")
     summaries = []
     for i in range(k):
@@ -392,6 +397,46 @@ def residual_distribution(y_true, y_pred, target_names, out):
     _figure_note(fig, interp)
     fig.tight_layout(rect=(0, CAPTION_BOTTOM, 1, 0.95))
     return _save(fig, out, title="Residual distribution", interpretation=interp)
+
+
+def cv_metric_distribution(distributions, out, validation_method="cross-validation"):
+    """Plot fold/repeat distributions for R2, RMSE, and MAE by target."""
+    data = dict(distributions or {})
+    if not data:
+        return _placeholder(out, "CV metric distributions", "No fold metrics are available.")
+    targets = list(data)
+    metrics = [("r2", "R2"), ("rmse", "RMSE"), ("mae", "MAE")]
+    fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.4), facecolor=SURF)
+    for ax, (key, display) in zip(axes, metrics):
+        style_ax(ax)
+        values = [np.asarray(data[t].get(key, []), dtype=float) for t in targets]
+        values = [v[np.isfinite(v)] for v in values]
+        positions = np.arange(1, len(targets) + 1)
+        if any(len(v) for v in values):
+            bp = ax.boxplot(values, positions=positions, patch_artist=True,
+                            showmeans=True, widths=0.55)
+            for box in bp["boxes"]:
+                box.set(facecolor=BLUE, alpha=0.42, edgecolor=INK2)
+            for median in bp["medians"]:
+                median.set(color=RED, linewidth=1.3)
+            for i, vals in enumerate(values, start=1):
+                if len(vals):
+                    jitter = np.linspace(-0.12, 0.12, len(vals))
+                    ax.scatter(i + jitter, vals, s=10, color=PURPLE, alpha=0.55)
+        ax.set_xticks(positions)
+        ax.set_xticklabels([short(label(t), 15) for t in targets], rotation=35, ha="right")
+        ax.set_ylabel(display)
+        ax.set_title(f"Fold/repeat {display}", loc="left", fontweight="bold")
+        if key == "r2":
+            ax.axhline(0, color=INK2, lw=0.8)
+    title = f"Cross-validation uncertainty - {validation_method}"
+    interp = ("Each point is one validation fold in one repeat. Boxes summarise "
+              "cross-validation uncertainty; they are not prediction intervals for "
+              "individual recipes.")
+    fig.suptitle(title, x=0.02, ha="left", fontweight="bold", color=INK)
+    _figure_note(fig, interp)
+    fig.tight_layout(rect=(0, CAPTION_BOTTOM, 1, 0.92))
+    return _save(fig, out, title=title, interpretation=interp)
 
 
 # =============================================================================
@@ -488,15 +533,24 @@ def mutual_information_bar(X_df, y, out, target_name="target", top=20):
 
 
 def model_performance_summary(metrics, out, title="Model performance summary"):
-    """Train/CV R2 and RMSE per target from app metrics tuples."""
+    """Train and pooled-OOF R2/RMSE per target (rich or legacy metrics)."""
     rows = list(metrics or [])
     if not rows:
         return _placeholder(out, title, "Train a model to view performance metrics.")
-    names = [r[0] for r in rows]
-    train_r2 = np.array([r[1] for r in rows], dtype=float)
-    train_rmse = np.array([r[2] for r in rows], dtype=float)
-    cv_r2 = np.array([r[3] for r in rows], dtype=float)
-    cv_rmse = np.array([r[4] for r in rows], dtype=float)
+    if isinstance(rows[0], dict):
+        names = [r["target"] for r in rows]
+        train_r2 = np.array([r["train_r2"] for r in rows], dtype=float)
+        train_rmse = np.array([r["train_rmse"] for r in rows], dtype=float)
+        cv_r2 = np.array([r["pooled_oof"]["r2"] for r in rows], dtype=float)
+        cv_rmse = np.array([r["pooled_oof"]["rmse"] for r in rows], dtype=float)
+        validation = rows[0].get("validation_method", "cross-validation")
+    else:
+        names = [r[0] for r in rows]
+        train_r2 = np.array([r[1] for r in rows], dtype=float)
+        train_rmse = np.array([r[2] for r in rows], dtype=float)
+        cv_r2 = np.array([r[3] for r in rows], dtype=float)
+        cv_rmse = np.array([r[4] for r in rows], dtype=float)
+        validation = "cross-validation"
     x = np.arange(len(names))
     fig, axes = plt.subplots(1, 2, figsize=(12.5, max(4.2, 0.35 * len(names) + 2)),
                              facecolor=SURF)
@@ -519,7 +573,7 @@ def model_performance_summary(metrics, out, title="Model performance summary"):
         ax.set_xticklabels([short(label(n), 18) for n in names], rotation=45, ha="right")
     gap = float(np.nanmean(train_r2 - cv_r2))
     best = names[int(np.nanargmax(cv_r2))] if len(cv_r2) else "target"
-    interp = (f"This chart compares in-sample training fit with 5-fold cross-validation. "
+    interp = (f"This chart compares in-sample training fit with {validation}. "
               f"The best CV R² is for {label(best)}. The average Train-CV R² gap is "
               f"{gap:.2f}; large positive gaps indicate overfitting.")
     fig.suptitle(title, x=0.02, ha="left", fontweight="bold", color=INK)
@@ -531,24 +585,42 @@ def model_performance_summary(metrics, out, title="Model performance summary"):
 def model_comparison_plot(results, out, title="Model comparison"):
     """Visual comparison of architecture benchmark rows from the Compare tab."""
     rows = list(results or [])
-    rows = [r for r in rows if len(r) >= 7]
     if not rows:
         return _placeholder(out, title, "Run model comparison first.")
-    names = [r[0] for r in rows]
-    cv_r2 = np.array([r[1] for r in rows], dtype=float)
-    cv_rmse = np.array([r[3] for r in rows], dtype=float)
-    cv_mae = np.array([r[4] for r in rows], dtype=float)
-    train_r2 = np.array([r[5] for r in rows], dtype=float)
-    pred_ms = np.array([r[6] for r in rows], dtype=float)
+    if isinstance(rows[0], dict):
+        rows = [r for r in rows if "r2" in r]
+        if not rows:
+            return _placeholder(out, title, "Every model evaluation failed.")
+        names = [r["name"] for r in rows]
+        cv_r2 = np.array([r["r2"]["mean"] for r in rows], dtype=float)
+        cv_rmse = np.array([r["rmse"]["mean"] for r in rows], dtype=float)
+        cv_mae = np.array([r["mae"]["mean"] for r in rows], dtype=float)
+        train_r2 = np.array([r["train_r2"] for r in rows], dtype=float)
+        pred_ms = np.array([r["predict_ms"] for r in rows], dtype=float)
+        r2_low = np.array([r["r2"]["lower"] for r in rows], dtype=float)
+        r2_high = np.array([r["r2"]["upper"] for r in rows], dtype=float)
+    else:
+        rows = [r for r in rows if len(r) >= 7]
+        names = [r[0] for r in rows]
+        cv_r2 = np.array([r[1] for r in rows], dtype=float)
+        cv_rmse = np.array([r[3] for r in rows], dtype=float)
+        cv_mae = np.array([r[4] for r in rows], dtype=float)
+        train_r2 = np.array([r[5] for r in rows], dtype=float)
+        pred_ms = np.array([r[6] for r in rows], dtype=float)
+        r2_low = cv_r2.copy(); r2_high = cv_r2.copy()
     order = np.argsort(np.nan_to_num(cv_r2, nan=-1e9))[::-1]
     names = [names[i] for i in order]
-    cv_r2, cv_rmse, cv_mae, train_r2, pred_ms = [a[order] for a in (cv_r2, cv_rmse, cv_mae, train_r2, pred_ms)]
+    cv_r2, cv_rmse, cv_mae, train_r2, pred_ms, r2_low, r2_high = [
+        a[order] for a in (cv_r2, cv_rmse, cv_mae, train_r2, pred_ms, r2_low, r2_high)]
     y = np.arange(len(names))
     fig, axes = plt.subplots(1, 3, figsize=(14.0, max(4.0, 0.45 * len(names) + 1.4)),
                              facecolor=SURF)
     for ax in axes:
         style_ax(ax)
     axes[0].barh(y, cv_r2, color=[GOOD if v >= 0.5 else (RED if v < 0 else BLUE) for v in cv_r2])
+    axes[0].errorbar(cv_r2, y, xerr=np.maximum(
+        np.vstack([cv_r2 - r2_low, r2_high - cv_r2]), 0.0),
+                     fmt="none", ecolor=INK2, capsize=3, lw=1)
     axes[0].set_yticks(y); axes[0].set_yticklabels([short(n, 26) for n in names], fontsize=8)
     axes[0].invert_yaxis(); axes[0].set_xlabel("CV R²"); axes[0].set_title("Generalization", loc="left", fontweight="bold")
     axes[1].barh(y - 0.18, cv_rmse, height=0.34, color=BLUE, label="RMSE")
@@ -584,7 +656,8 @@ def _shap_values_for(estimator, X_df):
     return np.asarray(sv), Xs
 
 
-def shap_summary(estimator, X_df, out, target_name="", max_display=15):
+def shap_summary(estimator, X_df, out, target_name="", max_display=15,
+                 display_labels=None):
     try:
         import shap  # noqa: F401
     except ImportError:
@@ -593,7 +666,8 @@ def shap_summary(estimator, X_df, out, target_name="", max_display=15):
     try:
         sv, Xs = _shap_values_for(estimator, X_df)
         fig = plt.figure(facecolor=SURF)
-        shap.summary_plot(sv, Xs, max_display=max_display, show=False,
+        names = [dict(display_labels or {}).get(str(c), str(c)) for c in Xs.columns]
+        shap.summary_plot(sv, Xs, feature_names=names, max_display=max_display, show=False,
                           plot_size=(9, max(4, 0.4 * min(max_display, X_df.shape[1]) + 2)))
         fig = plt.gcf()
         fig.patch.set_facecolor(SURF)
@@ -604,7 +678,8 @@ def shap_summary(estimator, X_df, out, target_name="", max_display=15):
         return _placeholder(out, "SHAP summary", f"Could not compute SHAP values:\n{e}")
 
 
-def shap_dependence(estimator, X_df, out, target_name="", top_k=4):
+def shap_dependence(estimator, X_df, out, target_name="", top_k=4,
+                    display_labels=None):
     try:
         import shap  # noqa: F401
     except ImportError:
@@ -627,8 +702,9 @@ def shap_dependence(estimator, X_df, out, target_name="", top_k=4):
             xv = Xs.iloc[:, xi].values
             ax.scatter(xv, sv[:, xi], s=16, color=BLUE, alpha=0.55, edgecolors="none")
             ax.axhline(0, color=MUTED, lw=1, ls="--")
-            ax.set_title(short(feat, 26), fontsize=10, loc="left", fontweight="bold")
-            ax.set_xlabel(short(feat, 26)); ax.set_ylabel("SHAP value")
+            display = dict(display_labels or {}).get(str(feat), str(feat))
+            ax.set_title(short(display, 26), fontsize=10, loc="left", fontweight="bold")
+            ax.set_xlabel(short(display, 26)); ax.set_ylabel("SHAP value")
             ax.xaxis.set_major_locator(MaxNLocator(5))
         for j in range(len(feats), len(axes)):
             axes[j].axis("off")

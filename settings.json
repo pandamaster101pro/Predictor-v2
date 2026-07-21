@@ -1,0 +1,46 @@
+{
+  "name": "BioCarbon LIB_1A model settings",
+  "source_file": "C:/Users/28jay/Downloads/20250730_exp_conditions_Cheny_with_composition.xlsx",
+  "dataset": "工作表1",
+  "target": "LIB_1A",
+  "ids": [
+    "批號"
+  ],
+  "messy": [
+    "Pretreat 1",
+    "Pretreat 2",
+    "post-treat",
+    "addtive 1",
+    "addtive 2"
+  ],
+  "features": {
+    "numerical": [
+      "Py.1 temp. (oC)",
+      "Py.1 time (min)",
+      "Py.2 temp. (oC)",
+      "Py.2 time (min)",
+      "Py.3 temp. (oC)",
+      "Py.3 time (min)",
+      "Cellulose_avg_pct",
+      "Hemicellulose_avg_pct",
+      "Lignin_avg_pct"
+    ],
+    "categorical": [
+      "Material",
+      "Atmosphere 1",
+      "Atmosphere 2",
+      "Atmosphere 3"
+    ]
+  },
+  "exclude": [
+    "Note",
+    "LIB_0_1A",
+    "LIB_30mA",
+    "SIB_1A",
+    "SIB_0_1A",
+    "SIB_30mA",
+    "Unnamed: 23",
+    "Unnamed: 24",
+    "Unnamed: 25"
+  ]
+}

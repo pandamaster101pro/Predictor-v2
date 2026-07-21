@@ -78,6 +78,7 @@ check_dependencies()
 import os
 import re
 import json
+import math
 import numpy as np
 import time
 import pandas as pd
@@ -98,6 +99,9 @@ import intelligence
 import screening
 import report
 import units
+import slideshow
+import validation as V
+import chemistry_features as chemistry
 
 MODEL_OUT = "model.joblib"
 RANDOM_STATE = 42
@@ -419,6 +423,50 @@ def draw_recipe_inputs(id_prefix, mark_dirty=False):
     return consumed
 
 
+def _chemistry_model_columns():
+    columns = set(STATE.chemistry_schema.get("interactions", []))
+    for info in STATE.chemistry_schema.get("columns", {}).values():
+        columns.update(info.get("descriptor_columns", []))
+    return columns
+
+
+def draw_chemical_inputs(id_prefix, mark_dirty=False):
+    """Render original chemical selectors while descriptors stay model-internal."""
+    for source, info in STATE.chemistry_schema.get("columns", {}).items():
+        choices = list(info.get("observed_chemicals", []))
+        custom_label = "Custom / inferred..."
+        display_choices = choices + [custom_label]
+        custom = STATE.chemistry_custom_values.get(source, "")
+        selected = STATE.chemistry_values.get(source, choices[0] if choices else "Unknown")
+        idx = len(choices) if custom else (choices.index(selected) if selected in choices else len(choices))
+        imgui.set_next_item_width(300)
+        changed, idx = imgui.combo(f"{source}##chem_{id_prefix}_{source}", idx, display_choices)
+        if changed:
+            if idx < len(choices):
+                STATE.chemistry_values[source] = choices[idx]
+                STATE.chemistry_custom_values[source] = ""
+            else:
+                STATE.chemistry_custom_values[source] = custom or "Unknown"
+            if mark_dirty:
+                STATE.screen_dirty = True
+        if idx == len(choices) or STATE.chemistry_custom_values.get(source):
+            imgui.set_next_item_width(300)
+            changed, value = imgui.input_text(
+                f"New chemical formula/name##chem_custom_{id_prefix}_{source}",
+                STATE.chemistry_custom_values.get(source, ""))
+            if changed:
+                STATE.chemistry_custom_values[source] = value
+                if mark_dirty:
+                    STATE.screen_dirty = True
+            if value.strip():
+                descriptor = chemistry.ENGINE.generator.describe(value.strip())
+                sims = chemistry.ENGINE.generator.similarities(value.strip(), top=2)
+                sim_text = ", ".join(f"{s.name} {s.score:.2f}" for s in sims)
+                imgui.text_colored(
+                    DIM, f"{descriptor.categorical['ChemicalClass']} · inferred confidence "
+                         f"{descriptor.confidence:.2f} · nearest: {sim_text}")
+
+
 def prepare_raw(df, ids, mixed):
     """
     Drop id columns and parse+drop every messy column into its own anonymized
@@ -494,21 +542,41 @@ def apply_col_type_overrides(df, overrides):
     return df
 
 
-def build_Xy(cfg, notes=None):
-    """
-    Full preprocessing shared by training and the model-comparison benchmark:
-    drop empty columns, drop rows with no target, drop blank/'Unknown'-only rows,
-    prune sparse/high-cardinality features, impute, one-hot encode.
+def _looks_like_battery_target(column):
+    """Conservative detector used to withhold other outcomes in publication mode."""
+    name = str(column)
+    return bool(
+        re.search(r"(?:^|_)(?:LIB|SIB)(?:_|$)", name, re.I)
+        or re.search(r"(?:capacity|retention|coulombic|ICE)(?:_|$)", name, re.I)
+    )
 
-    `notes` (optional list) collects human-readable messages about what was dropped.
-    Returns (X_encoded, y, numeric_schema, categorical_schema).
+
+def build_training_data(cfg, notes=None):
+    """Build aligned raw/encoded predictors, targets, groups, and schemas.
+
+    The raw frame is retained for leakage-safe fold-local preprocessing.  The
+    encoded frame is only used to fit the final deployable model on all rows and
+    to preserve the existing prediction/screening workflow.
     """
     def log(msg):
         if notes is not None:
             notes.append(msg)
 
-    df = read_any(cfg["data_path"], sheet=cfg.get("sheet"))
-    df = prepare_raw(df, cfg["ids"], cfg["mixed"])
+    raw_df = read_any(cfg["data_path"], sheet=cfg.get("sheet")).reset_index(drop=True)
+    validation_cfg = V.normalize_validation_config(cfg.get("validation"))
+    group_column = validation_cfg.get("group_column", "")
+    grouped = validation_cfg["method"] != "random_kfold"
+    if grouped and not group_column:
+        raise ValueError("Choose a grouping column for grouped validation.")
+    if grouped and group_column not in raw_df.columns:
+        raise ValueError(f"Grouping column '{group_column}' was not found in the dataset.")
+    groups = (raw_df[group_column].copy() if group_column in raw_df.columns
+              else pd.Series(np.arange(len(raw_df)), name="row"))
+
+    # IDs are never eligible predictors.  The grouping column is held separately
+    # even when the user did not also classify it as an ID.
+    drop_ids = list(dict.fromkeys(list(cfg.get("ids", [])) + ([group_column] if group_column else [])))
+    df = prepare_raw(raw_df, drop_ids, cfg["mixed"])
     # Standardize measurement units per column BEFORE numeric coercion, so cells
     # like "2 h" become 120 (minutes) and a "(K)" temperature column becomes °C.
     # Targets (labels) and manually-typed columns are protected from conversion.
@@ -545,7 +613,7 @@ def build_Xy(cfg, notes=None):
     if empty:
         df = df.drop(columns=empty)
 
-    targets = cfg["targets"]
+    targets = list(cfg["targets"])
     if not targets:
         raise ValueError(
             "No target column selected. Type the target column name(s) in the "
@@ -555,11 +623,25 @@ def build_Xy(cfg, notes=None):
     if missing:
         raise ValueError(f"Target columns not found: {missing}")
 
+    # In single-target publication mode, measured battery outcomes other than the
+    # chosen target are explicitly withheld so one capacity cannot predict another.
+    if cfg.get("single_target_mode"):
+        if len(targets) != 1:
+            raise ValueError("Single-target publication mode requires exactly one active target.")
+        other_targets = [c for c in df.columns
+                         if c not in targets and (_looks_like_battery_target(c)
+                                                  or c in cfg.get("all_target_columns", []))]
+        if other_targets:
+            df = df.drop(columns=other_targets, errors="ignore")
+            log(f"Publication leakage guard excluded {len(other_targets)} other outcome column(s).")
+
     # Targets: coerce to numeric, then DROP rows with no label (never impute y).
     for col in targets:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     n0 = len(df)
-    df = df.dropna(subset=targets).reset_index(drop=True)
+    target_mask = df[targets].notna().all(axis=1)
+    df = df.loc[target_mask].reset_index(drop=True)
+    groups = groups.loc[target_mask].reset_index(drop=True)
     log(f"Kept {len(df)}/{n0} rows with an observed target.")
 
     # Drop rows whose features are essentially all blank / 'Unknown'.
@@ -574,11 +656,31 @@ def build_Xy(cfg, notes=None):
 
     frac = df[feat_only].apply(informative_frac, axis=1)
     n1 = len(df)
-    df = df[frac >= MIN_INFORMATIVE_FRAC].reset_index(drop=True)
+    informative_mask = (frac >= MIN_INFORMATIVE_FRAC).to_numpy()
+    df = df.loc[informative_mask].reset_index(drop=True)
+    groups = groups.loc[informative_mask].reset_index(drop=True)
     log(f"Dropped {n1 - len(df)} blank/'Unknown'-only rows -> {len(df)} rows.")
 
     X = df[feat_only].copy()
     y = df[targets]
+    original_predictor_count = int(X.shape[1])
+
+    chemistry_schema = {"columns": {}, "interactions": [],
+                        "descriptor_feature_count": 0,
+                        "rdkit_available": chemistry.ENGINE.generator.rdkit.available}
+    chemistry_originals = pd.DataFrame(index=X.index)
+    if cfg.get("chemistry_enabled", True):
+        expansion = chemistry.ENGINE.transform(X, include_original=False,
+                                               add_interactions=True)
+        X = expansion.frame
+        chemistry_schema = expansion.metadata
+        chemistry_originals = expansion.original_values
+        if chemistry_schema.get("columns"):
+            log(
+                f"Chemistry engine expanded {len(chemistry_schema['columns'])} chemical "
+                f"column(s) into {chemistry_schema['descriptor_feature_count']} descriptors "
+                f"and {len(chemistry_schema['interactions'])} targeted interaction(s)."
+            )
 
     # Feature selection: drop too-sparse and too-high-cardinality columns.
     dropped = 0
@@ -590,21 +692,45 @@ def build_Xy(cfg, notes=None):
             X = X.drop(columns=col); dropped += 1
     log(f"Feature selection: kept {X.shape[1]} columns (dropped {dropped} noisy).")
 
-    # Impute the survivors and record the schema (for predict-tab widgets).
+    # Record a raw frame for fold-local preprocessing. Categorical semantic
+    # normalization is deterministic; numeric imputation remains unfitted here.
     numeric_schema, categorical_schema = {}, {}
     for col in X.columns:
         if pd.api.types.is_numeric_dtype(X[col]):
             med = X[col].median()
             med = 0.0 if pd.isna(med) else float(med)
-            X[col] = X[col].fillna(med)
             numeric_schema[col] = med
         else:
-            # 'not-done' -> explicit "None" category; unknown -> "Missing".
             X[col] = normalize_categorical_series(X[col])
             categorical_schema[col] = sorted(X[col].unique().tolist())
 
-    X_enc = pd.get_dummies(X, drop_first=True)
-    return X_enc, y, numeric_schema, categorical_schema
+    X_raw = X.reset_index(drop=True)
+    X_for_final = X_raw.copy()
+    for col, med in numeric_schema.items():
+        X_for_final[col] = X_for_final[col].fillna(med)
+    X_enc = pd.get_dummies(X_for_final, drop_first=True).astype(float)
+    y = y.reset_index(drop=True)
+    groups.name = group_column or groups.name
+    if len(X_raw) != len(y) or len(groups) != len(y):
+        raise ValueError("Internal alignment error after cleaning X, y, and groups.")
+    return {
+        "X_raw": X_raw,
+        "X_encoded": X_enc,
+        "y": y,
+        "groups": groups,
+        "numeric_schema": numeric_schema,
+        "categorical_schema": categorical_schema,
+        "original_predictors": original_predictor_count,
+        "chemistry_schema": chemistry_schema,
+        "chemistry_originals": chemistry_originals.reset_index(drop=True),
+    }
+
+
+def build_Xy(cfg, notes=None):
+    """Backward-friendly five-value data builder requested by the Train workflow."""
+    data = build_training_data(cfg, notes=notes)
+    return (data["X_encoded"], data["y"], data["groups"],
+            data["numeric_schema"], data["categorical_schema"])
 
 
 # =============================================================================
@@ -684,7 +810,8 @@ def build_models():
 # =============================================================================
 def run_capacity_optimization(data_path, target, excluded, fixed, direction,
                               min_support=3, random_state=RANDOM_STATE, sheet=None,
-                              features=None, col_types=None, ids=None, mixed=None):
+                              features=None, col_types=None, ids=None, mixed=None,
+                              chemistry_enabled=True):
     """
     Train XGBoost to predict `target` from CONTROLLABLE inputs only, then use
     differential evolution to find the input recipe with the best predicted
@@ -736,6 +863,27 @@ def run_capacity_optimization(data_path, target, excluded, fixed, direction,
     # Split knobs into numeric ranges and categorical choices, honoring the
     # Column-types Numeric/Categorical assignment (falling back to dtype).
     X_raw = df[controllable].copy()
+    if chemistry_enabled:
+        chemistry_expansion = chemistry.ENGINE.transform(
+            X_raw, include_original=False, add_interactions=True)
+        chemistry_schema = chemistry_expansion.metadata
+        X_raw = chemistry_expansion.frame
+    else:
+        chemistry_schema = {"columns": {}, "interactions": []}
+    controllable = list(X_raw.columns)
+
+    # Fixed chemical names become fixed descriptor profiles; the optimizer never
+    # treats a reagent label as a one-hot category.
+    expanded_fixed = dict(fixed)
+    for source, info in chemistry_schema.get("columns", {}).items():
+        if source not in fixed:
+            continue
+        descriptor = chemistry.ENGINE.generator.describe(str(fixed[source]))
+        for key, value in descriptor.feature_values().items():
+            expanded_fixed[f"{info['prefix']}_{key}"] = value
+        expanded_fixed.pop(source, None)
+    fixed = {k: v for k, v in expanded_fixed.items() if k in controllable}
+
     numeric_cols, cat_choices = [], {}
     for c in controllable:
         kind = col_types.get(c)
@@ -755,6 +903,11 @@ def run_capacity_optimization(data_path, target, excluded, fixed, direction,
             counts = X_raw[c].value_counts()
             cat_choices[c] = sorted(counts[counts >= min_support].index.tolist()) \
                 or sorted(counts.index.tolist())
+
+    # Interaction columns stay in the fitted model but are derived inside each
+    # optimizer evaluation; they are not independent knobs a user could set.
+    interaction_columns = set(chemistry_schema.get("interactions", []))
+    search_numeric_cols = [c for c in numeric_cols if c not in interaction_columns]
 
     X_enc = pd.get_dummies(X_raw, drop_first=False)
     feat_cols = X_enc.columns.tolist()
@@ -784,13 +937,14 @@ def run_capacity_optimization(data_path, target, excluded, fixed, direction,
 
     # Search space = controllable knobs that are NOT fixed.
     bounds, integrality, spec = [], [], []
-    for c in numeric_cols:
+    for c in search_numeric_cols:
         if c in fixed:
             continue
         lo, hi = np.percentile(X_raw[c], 1), np.percentile(X_raw[c], 99)
         if lo == hi:
             hi = lo + 1e-6
-        bounds.append((lo, hi)); integrality.append(False)
+        bounds.append((lo, hi)); integrality.append(
+            chemistry.descriptor_is_discrete(c))
         spec.append(("num", c, col_pos.get(c)))
     for c, choices in cat_choices.items():
         if c in fixed:
@@ -810,6 +964,12 @@ def run_capacity_optimization(data_path, target, excluded, fixed, direction,
                 i = max(0, min(int(round(v)), len(s[2]) - 1))
                 if s[2][i] is not None:
                     x[s[2][i]] = 1.0
+        for interaction in chemistry_schema.get("interaction_specs", []):
+            out = col_pos.get(interaction["feature"])
+            left = col_pos.get(interaction["left"])
+            right = col_pos.get(interaction["right"])
+            if out is not None and left is not None and right is not None:
+                x[out] = x[left] * x[right]
         return x
 
     def objective(vec):
@@ -835,14 +995,37 @@ def run_capacity_optimization(data_path, target, excluded, fixed, direction,
             recipe[s[1]] = cat_choices[s[1]][i]
     predicted = float(model.predict(vectorize(result.x).reshape(1, -1))[0])
 
-    ordered = [(c, recipe[c]) for c in controllable]
+    chemistry_model_columns = set(chemistry_schema.get("interactions", []))
+    for info in chemistry_schema.get("columns", {}).values():
+        chemistry_model_columns.update(info.get("descriptor_columns", []))
+    ordered = [(c, recipe[c]) for c in controllable if c not in chemistry_model_columns]
+    chemical_recommendations = []
+    central = ("Is_Strong_Acid", "Is_Strong_Base", "pKa", "pKb",
+               "EstimatedOxidationTendency", "MolecularWeight", "Contains_Hydroxide")
+    for source, info in chemistry_schema.get("columns", {}).items():
+        nearest = chemistry.ENGINE.nearest_known_profile(recipe, info["prefix"], top=3)
+        if nearest:
+            ordered.append((f"Recommended {source}", nearest[0].name))
+            chemical_recommendations.append({
+                "column": source, "recommended": nearest[0].name,
+                "similarity": nearest[0].score,
+                "alternatives": [{"name": item.name, "score": item.score}
+                                 for item in nearest[1:]],
+            })
+        for key in central:
+            feature = f"{info['prefix']}_{key}"
+            if feature in recipe:
+                ordered.append((chemistry.descriptor_display_name(feature), recipe[feature]))
     return dict(target=target, r2=cv_r2, predicted=predicted,
                 obs_min=float(y.min()), obs_max=float(y.max()),
                 recipe=ordered, fixed=set(fixed), edges=edges,
                 labels=label_map,
-                n_rows=len(df), n_knobs=len(controllable),
+                n_rows=len(df), n_knobs=len(spec),
                 mode=("column-type" if column_type_mode else "manual"),
-                n_numeric=len(numeric_cols), n_categorical=len(cat_choices))
+                n_numeric=len(search_numeric_cols), n_categorical=len(cat_choices),
+                chemistry_schema=chemistry_schema,
+                chemical_recommendations=chemical_recommendations,
+                optimized_over="chemistry descriptors, mapped back to known reagents")
 
 
 # =============================================================================
@@ -856,6 +1039,27 @@ class AppState:
         self.id_columns = "serial_orig, serial_clean"
         self.target_columns = "100_1A, 100_0p1A, 100_10mA, 500_1A, 500_0p1A, 500_10mA"
 
+        # Publication validation controls shared by Train, Compare, and Charts.
+        self.validation_method_idx = 0     # Random KFold / GroupKFold / repeated grouped
+        self.group_column = ""
+        self.n_splits = 5
+        self.n_repeats = 10
+        self.confidence_level = 95.0
+        self.random_state = RANDOM_STATE
+        self.single_target_mode = False
+        self.single_target = ""
+        self.top_feature_count = 20
+        self.show_feature_ratio_warnings = True
+        self.chemistry_enabled = True
+        self.chemistry_pubchem_enabled = False
+        self.chemistry_schema = {}
+        self.chemistry_originals = None
+        self.chemical_knowledge = []
+        self.chemistry_status = "Load a dataset, then scan chemical knowledge."
+        self.chemistry_selected_idx = 0
+        self.chemistry_values = {}         # {original chemical column: selected value}
+        self.chemistry_custom_values = {}  # free-form unseen chemicals such as HBr
+
         # --- Worksheet/tab selection for multi-sheet .xlsx files ---
         self.sheet_names = []              # tabs in the chosen data file ([] = single/CSV)
         self.sheet_idx = 0                 # which tab is selected
@@ -866,6 +1070,7 @@ class AppState:
         self.data_dialog = None
         self.batch_dialog = None
         self.json_dialog = None
+        self.json_save_dialog = None
 
         # --- Training status (written by the background thread) ---
         self.is_training = False
@@ -883,7 +1088,15 @@ class AppState:
         self.cfg = {}                      # {ids, mixed} used at train time
 
         # --- Evaluation results for display ---
-        self.metrics = []                  # [(target, tr_r2, tr_rmse, cv_r2, cv_rmse), ...]
+        self.metrics = []                  # rich per-target metric dictionaries
+        self.metric_distributions = {}
+        self.validation_config = V.normalize_validation_config()
+        self.feature_diagnostics = {}
+        self.oof_predictions = None
+        self.oof_prediction_std = None
+        self.oof_prediction_samples = None
+        self.oof_truth = None
+        self.preprocessing_statement = ""
         self.importances = []             # [(feature, importance), ...]
         self.summary = ""
 
@@ -919,6 +1132,7 @@ class AppState:
         self.compare_status = "Set the columns in the Train tab, then run the benchmark."
         self.compare_error = ""
         self.compare_results = []          # [(model_name, avg_oof_r2), ...] completed
+        self.compare_validation_summary = {}
         self.compare_current = ""          # model currently being evaluated
         self.compare_total = 0
         self.compare_done = 0
@@ -955,6 +1169,8 @@ class AppState:
         self.charts_error = ""
         self.chart_items = []              # [(title, rel_path), ...] rendered PNGs
         self.charts_run = 0                # bumped each run -> unique names (texture cache)
+        self.slideshow_dialog = None       # async save-file dialog for the slideshow
+        self.slideshow_status = ""         # result message for the slideshow export
 
         # --- Latent Variables tab ---
         self.lat_columns = []              # available columns (from file/sheet)
@@ -1045,6 +1261,102 @@ def _current_sheet():
     return None
 
 
+def _validation_config_from_state():
+    methods = ["random_kfold", "group_kfold", "repeated_grouped_cv"]
+    idx = min(max(int(STATE.validation_method_idx), 0), len(methods) - 1)
+    return V.normalize_validation_config({
+        "method": methods[idx],
+        "group_column": STATE.group_column,
+        "n_splits": STATE.n_splits,
+        "n_repeats": STATE.n_repeats,
+        "confidence_level": STATE.confidence_level / 100.0,
+        "random_state": STATE.random_state,
+        "interval_method": "percentile",
+    })
+
+
+def _active_targets_from_state():
+    targets = _split_cols(STATE.target_columns)
+    if not STATE.single_target_mode:
+        return targets
+    return [STATE.single_target] if STATE.single_target else []
+
+
+def _training_config_from_state():
+    return dict(
+        data_path=STATE.data_path,
+        ids=_split_cols(STATE.id_columns),
+        mixed=_split_cols(STATE.mixed_column),
+        targets=_active_targets_from_state(),
+        all_target_columns=[c for c in STATE.coltype_columns
+                            if STATE.coltype_role.get(c) == "target"],
+        single_target_mode=STATE.single_target_mode,
+        col_types=dict(STATE.coltype_map),
+        exclude=_split_cols(STATE.exclude_columns),
+        sheet=_current_sheet(),
+        standardize_units=STATE.standardize_units,
+        validation=_validation_config_from_state(),
+        chemistry_enabled=STATE.chemistry_enabled,
+    )
+
+
+def _sync_validation_column_defaults(columns):
+    columns = list(map(str, columns))
+    if STATE.group_column not in columns:
+        STATE.group_column = next(
+            (c for c in ("Condition_ID", "Group_ID", "Batch_ID") if c in columns), ""
+        )
+    if STATE.single_target not in columns:
+        configured = [c for c in _split_cols(STATE.target_columns) if c in columns]
+        STATE.single_target = ("SIB_0_1A" if "SIB_0_1A" in columns
+                               else (configured[0] if configured else ""))
+
+
+def _set_chemistry_state(schema, originals=None):
+    """Publish chemistry metadata and sensible prediction-widget defaults."""
+    STATE.chemistry_schema = dict(schema or {})
+    STATE.chemistry_originals = originals
+    all_values = []
+    for source, info in STATE.chemistry_schema.get("columns", {}).items():
+        choices = list(info.get("observed_chemicals", []))
+        current = STATE.chemistry_values.get(source)
+        if current not in choices:
+            current = choices[0] if choices else "Unknown"
+        STATE.chemistry_values[source] = current
+        STATE.chemistry_custom_values.setdefault(source, "")
+        all_values.extend(choices)
+    STATE.chemical_knowledge = chemistry.ENGINE.knowledge_for_values(all_values)
+    if STATE.chemistry_schema.get("columns"):
+        STATE.chemistry_status = (
+            f"Detected {len(STATE.chemistry_schema['columns'])} chemical column(s); "
+            f"generated {STATE.chemistry_schema.get('descriptor_feature_count', 0)} descriptors."
+        )
+
+
+def _chemistry_feature_labels(schema):
+    labels = {}
+    prefix_labels = {}
+    for source, info in (schema or {}).get("columns", {}).items():
+        source_label = STATE.feature_labels.get(source, source)
+        source_label = source_label.split(":", 1)[0].strip()
+        if source_label == source:
+            source_label = chemistry.ChemistryFeatureEngineer.prefix(source).replace("_", " ")
+        prefix_labels[info.get("prefix", "")] = source_label
+        for feature in info.get("descriptor_columns", []):
+            prefix = info.get("prefix", "")
+            token = feature[len(prefix) + 1:] if feature.startswith(prefix + "_") else feature
+            display = f"{source_label}: {chemistry.descriptor_display_name(token)}"
+            labels[feature] = display
+            for level in STATE.categorical_schema.get(feature, []):
+                labels[f"{feature}_{level}"] = f"{display} = {level}"
+    for feature in (schema or {}).get("interactions", []):
+        prefix = next((p for p in prefix_labels if feature.startswith(p + "_")), "")
+        token = feature[len(prefix) + 1:] if prefix else feature
+        label = chemistry.descriptor_display_name(token)
+        labels[feature] = f"{prefix_labels[prefix]}: {label}" if prefix else label
+    return labels
+
+
 def _autofill_columns(path):
     """Detect and fill the step-2 fields from the chosen spreadsheet."""
     try:
@@ -1110,14 +1422,38 @@ def scan_column_types():
         STATE.coltype_map = new_map
         STATE.coltype_role = new_role
         sync_roles_to_cfg()                     # push roles into the Train-tab fields
+        _sync_validation_column_defaults(cols)
         n_num = sum(1 for v in new_map.values() if v == "numeric")
         n_tgt = sum(1 for v in new_role.values() if v == "target")
         STATE.coltype_status = (
             f"Scanned {len(cols)} column(s) · {n_num} numeric / "
             f"{len(cols) - n_num} categorical · {n_tgt} target(s). Adjust below, then Train."
         )
+        scan_chemical_knowledge(silent=True)
     except Exception as e:  # noqa: BLE001
         STATE.coltype_status = f"Scan failed: {e}"
+
+
+def scan_chemical_knowledge(silent=False):
+    """Detect reagent columns and cache the descriptor preview for the UI."""
+    if not STATE.data_path:
+        if not silent:
+            STATE.chemistry_status = "Choose a spreadsheet in the Train tab first."
+        return
+    try:
+        raw = read_any(STATE.data_path, nrows=500, sheet=_current_sheet())
+        prepared = prepare_raw(raw, _split_cols(STATE.id_columns),
+                               _split_cols(STATE.mixed_column))
+        if STATE.standardize_units:
+            prepared = units.standardize_parsed_mixed(
+                prepared, labels=mixed_feature_labels(_split_cols(STATE.mixed_column)))
+        expansion = chemistry.ENGINE.transform(prepared, include_original=False,
+                                               add_interactions=True)
+        _set_chemistry_state(expansion.metadata, expansion.original_values)
+        if not expansion.metadata.get("columns"):
+            STATE.chemistry_status = "No chemical columns were detected automatically."
+    except Exception as e:  # noqa: BLE001
+        STATE.chemistry_status = f"Chemical scan failed: {e}"
 
 
 def sync_roles_to_cfg():
@@ -1142,7 +1478,7 @@ def apply_json_config(path):
     Columns named in the JSON are added to the table even if a scan hasn't run.
     """
     with open(path, "r", encoding="utf-8") as f:
-        spec = json.load(f)
+        spec = V.load_settings_compat(json.load(f))
 
     feats = spec.get("features", {}) or {}
     categorical = [str(c) for c in feats.get("categorical", [])]
@@ -1151,6 +1487,37 @@ def apply_json_config(path):
     if not targets and spec.get("target"):
         targets = [str(spec["target"])]
     excluded = [str(c) for c in spec.get("exclude", [])]
+    ids = [str(c) for c in spec.get("ids", [])]
+    messy = [str(c) for c in spec.get("messy", [])]
+
+    validation_cfg = spec["validation"]
+    methods = ["random_kfold", "group_kfold", "repeated_grouped_cv"]
+    STATE.validation_method_idx = methods.index(validation_cfg["method"])
+    STATE.group_column = validation_cfg["group_column"]
+    STATE.n_splits = validation_cfg["n_splits"]
+    STATE.n_repeats = validation_cfg["n_repeats"]
+    STATE.confidence_level = validation_cfg["confidence_level"] * 100.0
+    STATE.random_state = validation_cfg["random_state"]
+    STATE.single_target_mode = bool(spec["training"].get("single_target_mode", False))
+    STATE.single_target = str(spec["training"].get("target") or "")
+    STATE.top_feature_count = max(1, int(spec["reporting"].get("top_feature_count", 20)))
+    STATE.show_feature_ratio_warnings = bool(
+        spec["reporting"].get("show_feature_ratio_warnings", True))
+    chemistry_spec = dict(spec.get("chemistry") or {})
+    STATE.chemistry_enabled = bool(chemistry_spec.get("enabled", True))
+    STATE.chemistry_pubchem_enabled = bool(
+        chemistry_spec.get("pubchem_enabled", False))
+    chemistry.ENGINE.generator.set_pubchem_enabled(STATE.chemistry_pubchem_enabled)
+    chemistry.ENGINE.generator.clear_overrides()
+    for chemical_name, values in chemistry_spec.get("overrides", {}).items():
+        chemistry.ENGINE.generator.set_override(chemical_name, values)
+
+    # Restore the source file when it is still available, then switch worksheet.
+    source_file = spec.get("source_file")
+    if source_file and os.path.exists(str(source_file)):
+        STATE.data_path = str(source_file)
+        STATE.sheet_names = list_sheets(STATE.data_path)
+        STATE.sheet_idx = 0
 
     # dataset -> worksheet/tab: switch to it and (re)scan so the table reflects it.
     dataset = spec.get("dataset")
@@ -1171,10 +1538,14 @@ def apply_json_config(path):
         STATE.coltype_role[c] = "target"
     for c in excluded:
         STATE.coltype_role[c] = "exclude"
+    for c in ids:
+        STATE.coltype_role[c] = "id"
+    for c in messy:
+        STATE.coltype_role[c] = "messy"
 
     # Make sure every JSON-named column is present in the table + config, keeping
     # any already-scanned order first, then appending anything new.
-    referenced = numerical + categorical + targets + excluded
+    referenced = numerical + categorical + targets + excluded + ids + messy
     seen = set(STATE.coltype_columns)
     for c in referenced:
         if c not in seen:
@@ -1190,6 +1561,43 @@ def apply_json_config(path):
     )
 
 
+def export_json_config(path):
+    """Save column roles plus the publication validation/reporting controls."""
+    def by_role(role):
+        return [c for c in STATE.coltype_columns if STATE.coltype_role.get(c) == role]
+
+    features = by_role("feature")
+    spec = {
+        "source_file": STATE.data_path,
+        "dataset": _current_sheet(),
+        "targets": _split_cols(STATE.target_columns),
+        "ids": by_role("id") or _split_cols(STATE.id_columns),
+        "messy": by_role("messy") or _split_cols(STATE.mixed_column),
+        "features": {
+            "numerical": [c for c in features if STATE.coltype_map.get(c) == "numeric"],
+            "categorical": [c for c in features if STATE.coltype_map.get(c) == "categorical"],
+        },
+        "exclude": by_role("exclude") or _split_cols(STATE.exclude_columns),
+        "validation": _validation_config_from_state(),
+        "training": {
+            "single_target_mode": STATE.single_target_mode,
+            "target": STATE.single_target,
+        },
+        "reporting": {
+            "top_feature_count": STATE.top_feature_count,
+            "show_feature_ratio_warnings": STATE.show_feature_ratio_warnings,
+        },
+        "chemistry": {
+            "enabled": STATE.chemistry_enabled,
+            "pubchem_enabled": STATE.chemistry_pubchem_enabled,
+            "overrides": chemistry.ENGINE.generator.export_overrides(),
+        },
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(spec, f, indent=2, ensure_ascii=False)
+    STATE.coltype_status = f"Saved settings to {path}."
+
+
 def start_training():
     """Kick off training on a background thread so the UI stays responsive."""
     if STATE.is_training or not STATE.data_path:
@@ -1201,115 +1609,124 @@ def start_training():
     STATE.status = "Starting…"
 
     # Snapshot config so the thread doesn't read fields being edited mid-run.
-    cfg = dict(
-        data_path=STATE.data_path,
-        ids=_split_cols(STATE.id_columns),
-        mixed=_split_cols(STATE.mixed_column),   # list: supports several messy columns
-        targets=_split_cols(STATE.target_columns),
-        col_types=dict(STATE.coltype_map),       # manual numeric/categorical overrides
-        exclude=_split_cols(STATE.exclude_columns),  # cols dropped from training
-        sheet=_current_sheet(),                  # selected worksheet/tab
-        standardize_units=STATE.standardize_units,   # Train-tab checkbox
-    )
+    cfg = _training_config_from_state()
     threading.Thread(target=_train_worker, args=(cfg,), daemon=True).start()
 
 
 def _train_worker(cfg):
+    """Train in the background using the shared leakage-safe validation engine."""
     try:
-        STATE.status = "Loading & cleaning data…"
+        STATE.status = "Loading and cleaning data..."
         STATE.progress = 0.2
-        targets = cfg["targets"]
-
-        # Shared cleaning: drop empty cols, no-target rows, blank rows, prune features.
+        targets = list(cfg["targets"])
         clean_notes = []
-        X_enc, y, numeric_schema, categorical_schema = build_Xy(cfg, notes=clean_notes)
-        X_enc = X_enc.astype(float)
+        data = build_training_data(cfg, notes=clean_notes)
+        X_raw = data["X_raw"]
+        X_enc = data["X_encoded"]
+        y = data["y"]
+        groups = data["groups"]
+        numeric_schema = data["numeric_schema"]
+        categorical_schema = data["categorical_schema"]
         feature_columns = X_enc.columns.tolist()
-
-        # No rows survived cleaning — explain WHY instead of the cryptic split error.
-        if len(X_enc) < 5:
+        if len(X_enc) < cfg["validation"]["n_splits"]:
             raise ValueError(
-                f"Only {len(X_enc)} usable row(s) after cleaning — can't train. "
-                f"Usually the Target column is wrong or not numeric (every row whose "
-                f"target isn't a number is dropped). Check the Target column(s): "
-                f"{', '.join(targets)}.  " + "  ".join(clean_notes)
+                f"Only {len(X_enc)} usable rows remain after cleaning; "
+                f"{cfg['validation']['n_splits']} folds were requested. "
+                + "  ".join(clean_notes)
             )
 
-        # The winning architecture: tuned MultiOutputRegressor(ExtraTrees).
-        model = MultiOutputRegressor(
-            ExtraTreesRegressor(
-                n_estimators=300, max_depth=12, min_samples_split=4,
-                max_features="sqrt", random_state=RANDOM_STATE, n_jobs=-1,
-            )
+        base_model = ExtraTreesRegressor(
+            n_estimators=300, max_depth=12, min_samples_split=4,
+            max_features="sqrt", random_state=cfg["validation"]["random_state"],
+            n_jobs=-1,
         )
-
-        # EVALUATION: 5-fold out-of-fold cross-validation. Every row is predicted
-        # by a model that never saw it, giving a stable generalization estimate
-        # (matches the Compare-models tab) instead of one volatile hold-out split.
-        STATE.status = "Evaluating with 5-fold cross-validation…"
+        model = base_model if len(targets) == 1 else MultiOutputRegressor(base_model)
+        validation_label = V.validation_method_label(cfg["validation"])
+        STATE.status = f"Evaluating with {validation_label}..."
         STATE.progress = 0.5
-        cv = KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
-        pred_cv = cross_val_predict(model, X_enc, y, cv=cv, n_jobs=-1)
+        evaluation = V.evaluate_model_cv(
+            model, X_raw, y, cfg["validation"], groups=groups,
+            numeric_columns=list(numeric_schema),
+            categorical_columns=list(categorical_schema),
+        )
 
-        # Fit the DEPLOYABLE model on ALL rows for the Predict tab + in-sample fit.
-        STATE.status = "Fitting final model on all rows…"
+        STATE.status = "Fitting final model on all usable rows..."
         STATE.progress = 0.9
-        model.fit(X_enc, y)
-        pred_tr = model.predict(X_enc)   # in-sample (training-fit) predictions
-        importances = np.mean(
-            [est.feature_importances_ for est in model.estimators_], axis=0
-        )
-        imp_series = pd.Series(importances, index=X_enc.columns).sort_values(
-            ascending=False
-        )
+        fit_y = y.iloc[:, 0] if len(targets) == 1 else y
+        model.fit(X_enc, fit_y)
+        pred_tr = np.asarray(model.predict(X_enc), dtype=float)
+        if pred_tr.ndim == 1:
+            pred_tr = pred_tr.reshape(-1, 1)
+        if hasattr(model, "estimators_") and len(targets) > 1:
+            importances = np.mean(
+                [est.feature_importances_ for est in model.estimators_], axis=0)
+        else:
+            importances = np.asarray(model.feature_importances_)
+        imp_series = pd.Series(importances, index=X_enc.columns).sort_values(ascending=False)
 
-        # Per-target metrics: in-sample train fit vs 5-fold cross-validation.
-        # A large train-vs-CV gap still flags overfitting.
+        method = cfg["validation"]["method"]
+        independent_groups = int(groups.nunique()) if method != "random_kfold" else len(X_enc)
+        effective_repeats = (cfg["validation"]["n_repeats"]
+                             if method == "repeated_grouped_cv" else 1)
         metrics = []
-        for i, col in enumerate(targets):
-            tr_r2 = r2_score(y.iloc[:, i], pred_tr[:, i])
-            tr_rmse = float(np.sqrt(mean_squared_error(y.iloc[:, i], pred_tr[:, i])))
-            cv_r2 = r2_score(y.iloc[:, i], pred_cv[:, i])
-            cv_rmse = float(np.sqrt(mean_squared_error(y.iloc[:, i], pred_cv[:, i])))
-            metrics.append((col, tr_r2, tr_rmse, cv_r2, cv_rmse))
+        for i, target in enumerate(targets):
+            metrics.append({
+                "target": target,
+                "train_r2": float(r2_score(y.iloc[:, i], pred_tr[:, i])),
+                "train_rmse": float(np.sqrt(mean_squared_error(y.iloc[:, i], pred_tr[:, i]))),
+                "cv": evaluation["metric_summaries"][target],
+                "pooled_oof": evaluation["pooled_metrics"][target],
+                "n_rows": len(X_enc),
+                "n_groups": independent_groups,
+                "n_splits": cfg["validation"]["n_splits"],
+                "n_repeats": effective_repeats,
+                "validation_method": validation_label,
+            })
 
-        # Publish results to the UI.
+        diagnostics = V.feature_diagnostics(
+            data["original_predictors"], len(feature_columns), len(X_enc),
+            independent_groups,
+        )
         STATE.model = model
         STATE.feature_columns = feature_columns
         STATE.numeric_schema = numeric_schema
         STATE.categorical_schema = categorical_schema
         STATE.targets = targets
-        STATE.cfg = {"ids": cfg["ids"], "mixed": cfg["mixed"]}
+        STATE.cfg = dict(cfg)
         STATE.feature_labels = mixed_feature_labels(cfg["mixed"])
+        STATE.feature_labels.update(_chemistry_feature_labels(data["chemistry_schema"]))
+        _set_chemistry_state(data["chemistry_schema"], data["chemistry_originals"])
         STATE.metrics = metrics
+        STATE.metric_distributions = evaluation["metric_distributions"]
+        STATE.validation_config = dict(cfg["validation"])
+        STATE.feature_diagnostics = diagnostics
+        STATE.oof_predictions = evaluation["oof_predictions"]
+        STATE.oof_prediction_std = evaluation["oof_prediction_std"]
+        STATE.oof_prediction_samples = evaluation["oof_prediction_samples"]
+        STATE.oof_truth = y.reset_index(drop=True)
+        STATE.preprocessing_statement = evaluation["preprocessing"]
         STATE.importances = list(imp_series.items())
-
-        # Keep the training data + CV metrics for the screening engine
-        # (applicability domain, similar experiments, uncertainty intervals).
         STATE.X_train = X_enc
         STATE.y_train = y.reset_index(drop=True)
-        STATE.cv_rmse = {col: m[4] for col, m in zip(targets, metrics)}
-        STATE.cv_r2 = {col: m[3] for col, m in zip(targets, metrics)}
+        STATE.cv_rmse = {m["target"]: m["pooled_oof"]["rmse"] for m in metrics}
+        STATE.cv_r2 = {m["target"]: m["pooled_oof"]["r2"] for m in metrics}
         rebuild_screener()
-        mean_tr = float(np.mean([m[1] for m in metrics]))
-        mean_cv = float(np.mean([m[3] for m in metrics]))
-        STATE.summary = (
-            f"ExtraTrees · 5-fold CV on {len(X_enc)} rows.  "
-            f"Train R2 = {mean_tr:.3f}  ·  CV R2 = {mean_cv:.3f}  ·  "
-            f"{len(feature_columns)} encoded features.  "
-            + "  ".join(clean_notes)
-        )
 
-        # Seed the predict-tab widgets with sensible defaults.
+        mean_tr = float(np.mean([m["train_r2"] for m in metrics]))
+        mean_cv = float(np.mean([m["pooled_oof"]["r2"] for m in metrics]))
+        STATE.summary = (
+            f"ExtraTrees - {validation_label} on {len(X_enc)} rows.  "
+            f"Train R2 = {mean_tr:.3f} - pooled OOF R2 = {mean_cv:.3f} - "
+            f"{len(feature_columns)} encoded features.  " + "  ".join(clean_notes)
+        )
         STATE.numeric_values = dict(numeric_schema)
         STATE.category_index = {c: 0 for c in categorical_schema}
         STATE.screen_custom_category = {c: "" for c in categorical_schema}
-        STATE.mixed_text = {}              # recompose '1M NaOH' texts from defaults
+        STATE.mixed_text = {}
         STATE.single_pred = None
         STATE.predict_error = ""
-
         STATE.trained = True
-        STATE.status = "Done. See metrics below, then use the Predict tab."
+        STATE.status = "Done. Review the grouped OOF metrics below, then use Predict."
         STATE.progress = 1.0
     except Exception as e:  # noqa: BLE001
         STATE.train_error = f"{type(e).__name__}: {e}"
@@ -1331,51 +1748,84 @@ def start_comparison():
     STATE.compare_total = 0
     STATE.compare_status = "Preparing data…"
 
-    cfg = dict(
-        data_path=STATE.data_path,
-        ids=_split_cols(STATE.id_columns),
-        mixed=_split_cols(STATE.mixed_column),
-        targets=_split_cols(STATE.target_columns),
-        col_types=dict(STATE.coltype_map),       # manual numeric/categorical overrides
-        exclude=_split_cols(STATE.exclude_columns),  # cols dropped from training
-        sheet=_current_sheet(),                  # selected worksheet/tab
-        standardize_units=STATE.standardize_units,   # Train-tab checkbox
-    )
+    cfg = _training_config_from_state()
     threading.Thread(target=_compare_worker, args=(cfg,), daemon=True).start()
+
+
+def _comparison_estimator(model, n_targets):
+    """Use scalar estimators in single-target mode and retain multi-output models."""
+    if n_targets == 1:
+        if isinstance(model, MultiOutputRegressor):
+            return model.estimator
+        if isinstance(model, RegressorChain):
+            return getattr(model, "estimator", getattr(model, "base_estimator", model))
+        return model
+    if isinstance(model, RegressorChain):
+        model.set_params(order=list(range(n_targets)))
+    return model
 
 
 def _compare_worker(cfg):
     try:
-        X, y, _, _ = build_Xy(cfg)
-        X = X.astype(float)  # get_dummies yields bool columns; models want floats
+        data = build_training_data(cfg)
+        X, y, groups = data["X_raw"], data["y"], data["groups"]
+        numeric = list(data["numeric_schema"])
+        categorical = list(data["categorical_schema"])
         models = build_models()
         STATE.compare_total = len(models)
-        kf = KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+        validation_label = V.validation_method_label(cfg["validation"])
+        STATE.compare_validation_summary = {
+            "label": validation_label,
+            "group_column": cfg["validation"].get("group_column", ""),
+            "n_splits": cfg["validation"]["n_splits"],
+            "n_repeats": (cfg["validation"]["n_repeats"]
+                          if cfg["validation"]["method"] == "repeated_grouped_cv" else 1),
+            "n_groups": (int(groups.nunique())
+                         if cfg["validation"]["method"] != "random_kfold" else len(X)),
+        }
 
-        for name, model in models.items():
+        for name, candidate in models.items():
             STATE.compare_current = name
-            STATE.compare_status = f"Evaluating {name}  ({STATE.compare_done + 1}/{STATE.compare_total})…"
+            STATE.compare_status = (
+                f"Evaluating {name} with {validation_label} "
+                f"({STATE.compare_done + 1}/{STATE.compare_total})..."
+            )
             t0 = time.time()
-            score = rmse = mae = train_r2 = float("nan")
-            predict_ms = float("nan")
+            row = {"name": name, "runtime": float("nan"),
+                   "train_r2": float("nan"), "predict_ms": float("nan")}
             try:
-                oof = cross_val_predict(model, X, y, cv=kf)
-                score = float(r2_score(y, oof, multioutput="uniform_average"))
-                rmse = float(np.sqrt(mean_squared_error(y, oof)))
-                mae = float(np.mean(np.abs(y.values - oof)))
-                cv_secs = time.time() - t0
-                # Train R² (in-sample) + a timed prediction pass for latency.
-                model.fit(X, y)
-                train_r2 = float(r2_score(y, model.predict(X),
+                model = _comparison_estimator(candidate, y.shape[1])
+                result = V.evaluate_model_cv(
+                    model, X, y, cfg["validation"], groups=groups,
+                    numeric_columns=numeric, categorical_columns=categorical,
+                )
+                aggregate = {}
+                for metric in ("r2", "rmse", "mae"):
+                    arrays = [result["metric_distributions"][t][metric] for t in y.columns]
+                    aggregate_scores = np.nanmean(np.asarray(arrays, dtype=float), axis=0)
+                    aggregate[metric] = V.calculate_metric_summary(
+                        aggregate_scores, cfg["validation"]["confidence_level"], "percentile")
+
+                final_pipe = make_pipeline(V.build_preprocessor(numeric, categorical), model)
+                fit_y = y.iloc[:, 0] if y.shape[1] == 1 else y
+                final_pipe.fit(X, fit_y)
+                pred_train = np.asarray(final_pipe.predict(X))
+                train_r2 = float(r2_score(fit_y, pred_train,
                                           multioutput="uniform_average"))
                 tp = time.time()
-                model.predict(X)
+                final_pipe.predict(X)
                 predict_ms = 1000.0 * (time.time() - tp) / max(len(X), 1)
-            except Exception as e:  # noqa: BLE001 - one bad model shouldn't stop the rest
-                cv_secs = time.time() - t0
+                row.update({
+                    "r2": aggregate["r2"], "rmse": aggregate["rmse"],
+                    "mae": aggregate["mae"], "train_r2": train_r2,
+                    "predict_ms": predict_ms,
+                    "validation_method": validation_label,
+                })
+            except Exception as e:  # noqa: BLE001
                 print(f"[compare] {name} failed: {e}")
-            STATE.compare_results.append(
-                (name, score, cv_secs, rmse, mae, train_r2, predict_ms))
+                row["error"] = str(e)
+            row["runtime"] = time.time() - t0
+            STATE.compare_results.append(row)
             STATE.compare_done += 1
 
         STATE.compare_current = ""
@@ -1385,7 +1835,8 @@ def _compare_worker(cfg):
             STATE.compare_run += 1
             STATE.compare_chart_path = C.model_comparison_plot(
                 STATE.compare_results,
-                f"{CHART_DIR}/compare_models_{STATE.compare_run}.png")
+                f"{CHART_DIR}/compare_models_{STATE.compare_run}.png",
+                title=f"Model comparison - {validation_label}")
         except Exception as e:  # noqa: BLE001
             print(f"[compare chart] failed: {e}")
         STATE.compare_status = f"Done. Benchmarked {STATE.compare_total} architectures."
@@ -1448,6 +1899,7 @@ def start_optimize():
         col_types=col_types,
         ids=ids,
         mixed=mixed,
+        chemistry_enabled=STATE.chemistry_enabled,
     )
     threading.Thread(target=_optimize_worker, args=(cfg,), daemon=True).start()
 
@@ -1459,7 +1911,8 @@ def _optimize_worker(cfg):
             cfg["data_path"], cfg["target"], cfg["excluded"],
             cfg["fixed"], cfg["direction"], sheet=cfg.get("sheet"),
             features=cfg.get("features"), col_types=cfg.get("col_types"),
-            ids=cfg.get("ids"), mixed=cfg.get("mixed"))
+            ids=cfg.get("ids"), mixed=cfg.get("mixed"),
+            chemistry_enabled=cfg.get("chemistry_enabled", True))
         STATE.opt_result = res
         src = ("column-type roles" if res.get("mode") == "column-type"
                else "manual exclusions")
@@ -1505,16 +1958,9 @@ def start_charts():
     STATE.chart_items = []
     STATE.charts_status = "Preparing data…"
 
-    cfg = dict(
-        data_path=STATE.data_path,
-        ids=_split_cols(STATE.id_columns),
-        mixed=_split_cols(STATE.mixed_column),
-        targets=_split_cols(STATE.target_columns) or list(STATE.targets),
-        col_types=dict(STATE.coltype_map),
-        exclude=_split_cols(STATE.exclude_columns),
-        sheet=_current_sheet(),                  # selected worksheet/tab
-        standardize_units=STATE.standardize_units,   # Train-tab checkbox
-    )
+    cfg = _training_config_from_state()
+    cfg["targets"] = list(STATE.targets)
+    cfg["validation"] = dict(STATE.validation_config)
     numeric_feats = list(STATE.numeric_schema.keys())
 
     def pick(idx):
@@ -1526,7 +1972,7 @@ def start_charts():
         pareto_b=STATE.charts_pareto_b,
         featx=pick(STATE.charts_featx_idx),
         featy=pick(STATE.charts_featy_idx),
-        imp_top=[5, 10, 20, 0][min(max(STATE.charts_imp_top_idx, 0), 3)],
+        imp_top=STATE.top_feature_count,
     )
     threading.Thread(target=_charts_worker, args=(cfg, opts), daemon=True).start()
 
@@ -1546,9 +1992,14 @@ def _charts_worker(cfg, opts):
         ti = min(max(opts["target_idx"], 0), len(targets) - 1)
 
         STATE.charts_status = "Loading & cleaning data…"
-        X_enc, y, numeric_schema, categorical_schema = build_Xy(cfg)
-        X_enc = X_enc.astype(float)
+        data = build_training_data(cfg)
+        X_enc, y = data["X_encoded"], data["y"]
+        numeric_schema = data["numeric_schema"]
+        categorical_schema = data["categorical_schema"]
         numeric_feats = list(numeric_schema.keys())
+        validation_label = V.validation_method_label(cfg["validation"])
+        grouping = cfg["validation"].get("group_column", "")
+        validation_title = validation_label + (f" by {grouping}" if grouping else "")
 
         # Correlation and target-signal analysis.
         STATE.charts_status = "1/13 · correlation analysis…"
@@ -1575,20 +2026,36 @@ def _charts_worker(cfg, opts):
 
         # Out-of-fold predictions (shared by charts 2 & 3), same model as training.
         STATE.charts_status = "6/13 · out-of-fold predictions…"
-        oof_model = MultiOutputRegressor(ExtraTreesRegressor(
-            n_estimators=300, max_depth=12, min_samples_split=4,
-            max_features="sqrt", random_state=RANDOM_STATE, n_jobs=-1))
-        oof = cross_val_predict(
-            oof_model, X_enc, y, cv=KFold(5, shuffle=True, random_state=RANDOM_STATE))
+        if STATE.oof_predictions is None or len(STATE.oof_predictions) != len(y):
+            base = ExtraTreesRegressor(
+                n_estimators=300, max_depth=12, min_samples_split=4,
+                max_features="sqrt", random_state=cfg["validation"]["random_state"],
+                n_jobs=-1)
+            oof_model = base if len(targets) == 1 else MultiOutputRegressor(base)
+            evaluation = V.evaluate_model_cv(
+                oof_model, data["X_raw"], y, cfg["validation"], groups=data["groups"],
+                numeric_columns=list(numeric_schema),
+                categorical_columns=list(categorical_schema))
+            oof = evaluation["oof_predictions"].to_numpy()
+            distributions = evaluation["metric_distributions"]
+        else:
+            oof = STATE.oof_predictions.to_numpy()
+            distributions = STATE.metric_distributions
         r2_by = {t: float(r2_score(y.iloc[:, i], oof[:, i])) for i, t in enumerate(targets)}
 
         items.append(("Predicted vs actual",
-                      C.predicted_vs_actual(y.values, oof, targets, path("pva"), r2_by)))
+                      C.predicted_vs_actual(y.values, oof, targets, path("pva"), r2_by,
+                                            validation_method=validation_title)))
         STATE.charts_status = "7/13 · residual diagnostics…"
         items.append(("Residual plot",
-                      C.residual_plot(y.values, oof, targets, path("resid"))))
+                      C.residual_plot(y.values, oof, targets, path("resid"),
+                                      validation_method=validation_title)))
         items.append(("Residual distribution",
-                      C.residual_distribution(y.values, oof, targets, path("resid_dist"))))
+                      C.residual_distribution(y.values, oof, targets, path("resid_dist"),
+                                              validation_method=validation_title)))
+        items.append(("Fold/repeat metric distributions",
+                      C.cv_metric_distribution(distributions, path("cv_dist"),
+                                               validation_method=validation_title)))
 
         # 4. Feature importance (folded back to source columns).
         STATE.charts_status = "9/13 · feature importance…"
@@ -1601,13 +2068,17 @@ def _charts_worker(cfg, opts):
 
         # 5 & 6. SHAP on the trained single-target estimator.
         Xs_shap = X_enc.reindex(columns=STATE.feature_columns, fill_value=0)
-        est = STATE.model.estimators_[ti] if hasattr(STATE.model, "estimators_") else STATE.model
+        est = (STATE.model.estimators_[ti]
+               if len(targets) > 1 and hasattr(STATE.model, "estimators_")
+               else STATE.model)
         STATE.charts_status = "10/13 · SHAP summary (can be slow)…"
         items.append(("SHAP summary",
-                      C.shap_summary(est, Xs_shap, path("shap_sum"), targets[ti])))
+                      C.shap_summary(est, Xs_shap, path("shap_sum"), targets[ti],
+                                     display_labels=STATE.feature_labels)))
         STATE.charts_status = "11/13 · SHAP dependence…"
         items.append(("SHAP dependence",
-                      C.shap_dependence(est, Xs_shap, path("shap_dep"), targets[ti])))
+                      C.shap_dependence(est, Xs_shap, path("shap_dep"), targets[ti],
+                                        display_labels=STATE.feature_labels)))
 
         # 7. Optimization heatmap — sweep two numeric knobs through the model.
         STATE.charts_status = "12/13 · optimization heatmap…"
@@ -1621,7 +2092,7 @@ def _charts_worker(cfg, opts):
                 picks[1] if len(picks) > 1 else None)
 
         def predict_fn(raw_df):
-            return STATE.model.predict(build_matrix(raw_df))
+            return _predict_2d(STATE.model, build_matrix(raw_df))
 
         if fx and fy and fx != fy:
             xr = (float(np.percentile(X_enc[fx], 2)), float(np.percentile(X_enc[fx], 98)))
@@ -1897,6 +2368,28 @@ def _intel_worker(cfg, opts):
         df = read_any(STATE.data_path, sheet=opts["sheet"])
         if cfg.target not in df.columns:
             raise ValueError(f"Target '{cfg.target}' not found in the sheet.")
+        if STATE.chemistry_enabled:
+            original_cat, original_num = cfg.feature_columns(list(df.columns))
+            feature_frame = df[original_cat + original_num].copy()
+            expansion = chemistry.ENGINE.transform(
+                feature_frame, include_original=False, add_interactions=True)
+            if expansion.metadata.get("columns"):
+                chemical_sources = set(expansion.metadata["columns"])
+                exp_frame = expansion.frame.reset_index(drop=True)
+                # Merge the expanded columns in one concat (adding them one by one
+                # fragments the DataFrame); drop any pre-existing duplicates first.
+                drop = [c for c in df.columns
+                        if c in chemical_sources or c in exp_frame.columns]
+                df = pd.concat(
+                    [df.drop(columns=drop, errors="ignore").reset_index(drop=True),
+                     exp_frame], axis=1)
+                new_cat = [c for c in exp_frame
+                           if not pd.api.types.is_numeric_dtype(exp_frame[c])]
+                new_num = [c for c in exp_frame if c not in new_cat]
+                cfg = latent.LatentConfig(
+                    target=cfg.target, categorical=new_cat, numerical=new_num,
+                    excluded=list(cfg.excluded), chem_weights=cfg.chem_weights,
+                    biomass_method=cfg.biomass_method)
         # Fix numeric columns polluted by a stray text marker (e.g. an 'INPUT'
         # annotation row) so median imputation / PCA don't choke; never touch
         # columns the config treats as categorical.
@@ -2017,6 +2510,59 @@ def _intel_worker(cfg, opts):
         STATE.is_intel_running = False
 
 
+def _top_features_for_summary(n=5):
+    """Display-friendly [(name, importance), ...] for the slideshow conclusion."""
+    if not STATE.importances:
+        return []
+    agg = _aggregate_importance(STATE.importances, STATE.numeric_schema,
+                                STATE.categorical_schema)
+    ranked = sorted(agg.items(), key=lambda kv: -kv[1])[:n]
+    return [(pretty(name), val) for name, val in ranked]
+
+
+def export_slideshow(path):
+    """Build a narrated slideshow PDF of every chart generated this session.
+
+    Gathers whichever chart bundles exist (Model Diagnostics, Latent Variables,
+    Dataset Intelligence), adds a title slide, per-chart explanations, and an
+    auto-synthesised conclusion built from the CV metrics and top features.
+    """
+    sections = []
+    if STATE.chart_items:
+        sections.append(("Model Diagnostics", list(STATE.chart_items)))
+    if STATE.lat_chart_items:
+        sections.append(("Latent Variables", list(STATE.lat_chart_items)))
+    if STATE.intel_chart_items:
+        sections.append(("Dataset Intelligence", list(STATE.intel_chart_items)))
+    if not sections:
+        STATE.slideshow_status = "Generate charts first (Charts tab)."
+        return
+
+    dataset = os.path.basename(STATE.data_path) if STATE.data_path else "(unsaved dataset)"
+    targets = list(STATE.targets)
+    meta_rows = [
+        ("Dataset", dataset),
+        ("Target(s)", ", ".join(targets) if targets else "n/a"),
+        ("Training rows", STATE.metrics[0].get("n_rows", "n/a") if STATE.metrics else "n/a"),
+        ("Features", len(STATE.feature_columns) if STATE.feature_columns else "n/a"),
+        ("Charts", sum(len(items) for _, items in sections)),
+        ("Generated", time.strftime("%Y-%m-%d %H:%M")),
+    ]
+    try:
+        out = slideshow.build_slideshow(
+            path, sections,
+            title="Model Analysis Summary",
+            subtitle="BioCarbon Screen — hard-carbon synthesis",
+            meta_rows=meta_rows,
+            metrics=STATE.metrics,
+            top_features=_top_features_for_summary(),
+            targets=targets,
+        )
+        STATE.slideshow_status = f"Saved slideshow to '{out}'."
+    except Exception as e:  # noqa: BLE001
+        STATE.slideshow_status = f"Slideshow export failed: {e}"
+
+
 def intel_export_pdf():
     """One-click PDF report (Section 10)."""
     r = STATE.intel_results
@@ -2043,11 +2589,43 @@ def build_matrix(X_raw):
     category (drop_first=True would drop the only dummy and silently ignore the
     input); reindexing to the trained columns already omits each baseline dummy.
     """
-    X_enc = pd.get_dummies(X_raw, drop_first=False)
+    prepared = pd.DataFrame(X_raw).copy()
+    chemistry_columns = list(STATE.chemistry_schema.get("columns", {}))
+    if STATE.chemistry_enabled and chemistry_columns:
+        for source in chemistry_columns:
+            if source not in prepared:
+                if len(prepared) == 1:
+                    prepared[source] = (STATE.chemistry_custom_values.get(source, "").strip()
+                                        or STATE.chemistry_values.get(source, "Unknown"))
+                else:
+                    prepared[source] = "Unknown"
+        prepared = chemistry.ENGINE.transform(
+            prepared, chemistry_columns, include_original=False,
+            add_interactions=True).frame
+
+    # Apply the exact final-model schema after descriptor expansion.
+    cols = {}
+    for col, med in STATE.numeric_schema.items():
+        series = prepared.get(col)
+        if series is None:
+            series = pd.Series([med] * len(prepared), index=prepared.index)
+        cols[col] = coerce_numeric_series(series).fillna(med)
+    for col in STATE.categorical_schema:
+        series = prepared.get(col)
+        if series is None:
+            series = pd.Series(["Missing"] * len(prepared), index=prepared.index)
+        cols[col] = normalize_categorical_series(series)
+    X_enc = pd.get_dummies(pd.DataFrame(cols), drop_first=False)
     # Overlapping names (e.g. 'Electrolyte' vs 'Electrolyte_Additive') or odd cell
     # values can yield duplicate dummy columns; keep the first so reindex is safe.
     X_enc = X_enc.loc[:, ~X_enc.columns.duplicated()]
     return X_enc.reindex(columns=STATE.feature_columns, fill_value=0)
+
+
+def _predict_2d(model, X):
+    """Normalise scalar and multi-output estimator predictions for shared UI code."""
+    pred = np.asarray(model.predict(X), dtype=float)
+    return pred.reshape(-1, 1) if pred.ndim == 1 else pred
 
 
 def predict_single():
@@ -2062,7 +2640,7 @@ def predict_single():
         row[col] = custom or choices[STATE.category_index[col]]
     try:
         X_raw = pd.DataFrame([row])
-        preds = STATE.model.predict(build_matrix(X_raw))[0]
+        preds = _predict_2d(STATE.model, build_matrix(X_raw))[0]
         STATE.single_pred = list(zip(STATE.targets, [float(v) for v in preds]))
     except Exception as e:  # noqa: BLE001
         STATE.predict_error = f"Prediction failed: {e}"
@@ -2077,22 +2655,7 @@ def predict_batch(path, sheet=None):
         raw = read_any(path, sheet=sheet)
         prepared = prepare_raw(raw, STATE.cfg["ids"], STATE.cfg["mixed"])
 
-        # Rebuild the raw feature frame using the training schema + the same
-        # 'not-done' (-> 0 / "None") vs unknown (-> impute / "Missing") semantics.
-        cols = {}
-        for col, med in STATE.numeric_schema.items():
-            series = prepared.get(col)
-            if series is None:
-                series = pd.Series([med] * len(prepared))
-            cols[col] = coerce_numeric_series(series).fillna(med)
-        for col in STATE.categorical_schema:
-            series = prepared.get(col)
-            if series is None:
-                series = pd.Series(["Missing"] * len(prepared))
-            cols[col] = normalize_categorical_series(series)
-        X_raw = pd.DataFrame(cols)
-
-        preds = STATE.model.predict(build_matrix(X_raw))
+        preds = _predict_2d(STATE.model, build_matrix(prepared))
         out = raw.copy()
         for i, t in enumerate(STATE.targets):
             out[f"pred_{t}"] = preds[:, i]
@@ -2114,6 +2677,8 @@ def rebuild_screener():
             STATE.categorical_schema, STATE.targets, STATE.X_train, STATE.y_train,
             cv_rmse=STATE.cv_rmse, cv_r2=STATE.cv_r2,
             display_labels=STATE.feature_labels,
+            chemistry_schema=STATE.chemistry_schema,
+            chemistry_originals=STATE.chemistry_originals,
         )
     except Exception as e:  # noqa: BLE001 - screening is optional; never crash training
         STATE.screener = None
@@ -2129,13 +2694,29 @@ def save_model():
             "categorical_schema": STATE.categorical_schema,
             "targets": STATE.targets,
             "cfg": STATE.cfg,
+            "validation_config": STATE.validation_config,
+            "group_column": STATE.validation_config.get("group_column", ""),
+            "metrics": STATE.metrics,
+            "metric_distributions": STATE.metric_distributions,
+            "feature_diagnostics": STATE.feature_diagnostics,
+            "reporting": {"top_feature_count": STATE.top_feature_count,
+                          "show_feature_ratio_warnings": STATE.show_feature_ratio_warnings},
+            "oof_predictions": STATE.oof_predictions,
+            "oof_prediction_std": STATE.oof_prediction_std,
+            "oof_prediction_samples": STATE.oof_prediction_samples,
+            "oof_truth": STATE.oof_truth,
+            "preprocessing": STATE.preprocessing_statement,
+            "chemistry_schema": STATE.chemistry_schema,
+            "chemistry_originals": STATE.chemistry_originals,
+            "chemistry_overrides": chemistry.ENGINE.generator.export_overrides(),
+            "chemistry_enabled": STATE.chemistry_enabled,
+            "chemistry_pubchem_enabled": STATE.chemistry_pubchem_enabled,
             # Training data + CV metrics let a reloaded model still screen
             # (applicability domain, similar experiments, uncertainty).
             "X_train": STATE.X_train,
             "y_train": STATE.y_train,
             "cv_rmse": STATE.cv_rmse,
             "cv_r2": STATE.cv_r2,
-            "metrics": STATE.metrics,
             "importances": STATE.importances,
             "summary": STATE.summary,
             "feature_labels": STATE.feature_labels,
@@ -2144,8 +2725,37 @@ def save_model():
     )
 
 
+def _normalize_loaded_metrics(metrics, bundle):
+    """Convert pre-validation tuple metrics so old saved models still render."""
+    rows = list(metrics or [])
+    if not rows or isinstance(rows[0], dict):
+        return rows
+    converted = []
+    for row in rows:
+        if len(row) < 5:
+            continue
+        target, train_r2, train_rmse, cv_r2, cv_rmse = row[:5]
+        def summary(value):
+            return {"mean": float(value), "std": 0.0, "lower": float(value),
+                    "upper": float(value), "n": 1, "confidence_level": 0.95,
+                    "interval_method": "legacy"}
+        converted.append({
+            "target": target, "train_r2": float(train_r2),
+            "train_rmse": float(train_rmse),
+            "cv": {"r2": summary(cv_r2), "rmse": summary(cv_rmse),
+                   "mae": summary(float("nan"))},
+            "pooled_oof": {"r2": float(cv_r2), "rmse": float(cv_rmse),
+                           "mae": float("nan")},
+            "n_rows": (len(bundle.get("X_train"))
+                       if bundle.get("X_train") is not None else 0), "n_groups": 0,
+            "n_splits": 5, "n_repeats": 1,
+            "validation_method": "Legacy 5-fold CV",
+        })
+    return converted
+
+
 def load_model():
-    b = joblib.load(MODEL_OUT)
+    b = V.load_model_bundle_compat(joblib.load(MODEL_OUT))
     STATE.model = b["model"]
     STATE.feature_columns = b["feature_columns"]
     STATE.numeric_schema = b["numeric_schema"]
@@ -2158,7 +2768,34 @@ def load_model():
     STATE.y_train = b.get("y_train")
     STATE.cv_rmse = b.get("cv_rmse", {})
     STATE.cv_r2 = b.get("cv_r2", {})
-    STATE.metrics = b.get("metrics", [])
+    STATE.metrics = _normalize_loaded_metrics(b.get("metrics", []), b)
+    STATE.metric_distributions = b.get("metric_distributions", {})
+    STATE.validation_config = V.normalize_validation_config(b.get("validation_config"))
+    STATE.feature_diagnostics = b.get("feature_diagnostics", {})
+    STATE.oof_predictions = b.get("oof_predictions")
+    STATE.oof_prediction_std = b.get("oof_prediction_std")
+    STATE.oof_prediction_samples = b.get("oof_prediction_samples")
+    STATE.oof_truth = b.get("oof_truth")
+    STATE.preprocessing_statement = b.get("preprocessing", "Legacy model; preprocessing scope not recorded")
+    STATE.chemistry_enabled = bool(b.get("chemistry_enabled", False))
+    STATE.chemistry_pubchem_enabled = bool(b.get("chemistry_pubchem_enabled", False))
+    chemistry.ENGINE.generator.set_pubchem_enabled(STATE.chemistry_pubchem_enabled)
+    chemistry.ENGINE.generator.clear_overrides()
+    for chemical_name, values in (b.get("chemistry_overrides") or {}).items():
+        chemistry.ENGINE.generator.set_override(chemical_name, values)
+    _set_chemistry_state(
+        b.get("chemistry_schema", {}), b.get("chemistry_originals"))
+    methods = ["random_kfold", "group_kfold", "repeated_grouped_cv"]
+    STATE.validation_method_idx = methods.index(STATE.validation_config["method"])
+    STATE.group_column = b.get("group_column", STATE.validation_config.get("group_column", ""))
+    STATE.n_splits = STATE.validation_config["n_splits"]
+    STATE.n_repeats = STATE.validation_config["n_repeats"]
+    STATE.confidence_level = STATE.validation_config["confidence_level"] * 100.0
+    STATE.random_state = STATE.validation_config["random_state"]
+    STATE.single_target_mode = len(STATE.targets) == 1
+    STATE.single_target = STATE.targets[0] if len(STATE.targets) == 1 else ""
+    if STATE.feature_diagnostics:
+        STATE.top_feature_count = int(b.get("reporting", {}).get("top_feature_count", 20))
     STATE.importances = b.get("importances", [])
     STATE.summary = b.get("summary", "")
     STATE.numeric_values = dict(STATE.numeric_schema)
@@ -2183,6 +2820,15 @@ def _current_screen_raw():
         else:
             idx = STATE.category_index.get(col, 0)
             row[col] = choices[idx] if choices else "Missing"
+    original_chemicals = {}
+    for source in STATE.chemistry_schema.get("columns", {}):
+        value = (STATE.chemistry_custom_values.get(source, "").strip()
+                 or STATE.chemistry_values.get(source, "Unknown"))
+        row[source] = value
+        original_chemicals[source] = value
+    if original_chemicals:
+        row.update(chemistry.ENGINE.expand_row(row, STATE.chemistry_schema))
+        row.update(original_chemicals)  # reporting retains the original chemical names
     return row
 
 
@@ -2250,11 +2896,22 @@ def export_screen_report(path, kind):
         STATE.screen_export_msg = "Run a screen first."
         return
     try:
+        metadata = {
+            "validation_config": STATE.validation_config,
+            "metrics": STATE.metrics,
+            "metric_distributions": STATE.metric_distributions,
+            "feature_diagnostics": STATE.feature_diagnostics,
+            "preprocessing": STATE.preprocessing_statement,
+            "chemistry_schema": STATE.chemistry_schema,
+            "chemistry_overrides": chemistry.ENGINE.generator.export_overrides(),
+        }
         if kind == "pdf":
             report.build_prediction_pdf(path, STATE.screen_result, STATE.screener,
-                                        model_summary=STATE.summary)
+                                        model_summary=STATE.summary,
+                                        model_metadata=metadata)
         else:
-            report.export_prediction_excel(path, STATE.screen_result, STATE.screener)
+            report.export_prediction_excel(path, STATE.screen_result, STATE.screener,
+                                           model_metadata=metadata)
         STATE.screen_export_msg = f"Saved report to {path}"
     except Exception as e:  # noqa: BLE001
         STATE.screen_export_msg = f"Export failed: {e}"
@@ -2356,6 +3013,7 @@ def draw_train_tab():
             "Sheet / tab", STATE.sheet_idx, STATE.sheet_names)
         if changed:
             _autofill_columns(STATE.data_path)  # re-detect columns for the new tab
+            
 
     imgui.dummy(imgui.ImVec2(0, 6))
     imgui.text("2) Confirm the columns")
@@ -2376,8 +3034,76 @@ def draw_train_tab():
                             "off = use values exactly as in the sheet")
 
     imgui.dummy(imgui.ImVec2(0, 6))
-    imgui.text("3) Train")
-    imgui.text_colored(DIM, "Evaluated with 5-fold cross-validation (stable on small data).")
+    imgui.text("3) Validation settings")
+    methods = ["Random KFold", "GroupKFold", "Repeated Grouped CV"]
+    imgui.set_next_item_width(260)
+    _, STATE.validation_method_idx = imgui.combo(
+        "Validation method", STATE.validation_method_idx, methods)
+    grouped = STATE.validation_method_idx in (1, 2)
+    if grouped:
+        columns = list(STATE.coltype_columns)
+        if STATE.group_column and STATE.group_column not in columns:
+            columns.append(STATE.group_column)
+        if columns:
+            group_idx = columns.index(STATE.group_column) if STATE.group_column in columns else 0
+            imgui.set_next_item_width(260)
+            changed, group_idx = imgui.combo("Grouping column", group_idx, columns)
+            if changed or not STATE.group_column:
+                STATE.group_column = columns[group_idx]
+        else:
+            imgui.text_colored(RED, "Load a dataset to choose the required grouping column.")
+    else:
+        imgui.text_colored(DIM, "Grouping column: not required for Random KFold")
+
+    imgui.set_next_item_width(120)
+    changed, value = imgui.input_int("Number of folds", int(STATE.n_splits))
+    if changed:
+        STATE.n_splits = max(2, value)
+    if STATE.validation_method_idx == 2:
+        imgui.set_next_item_width(120)
+        changed, value = imgui.input_int("Number of repeats", int(STATE.n_repeats))
+        if changed:
+            STATE.n_repeats = max(1, value)
+    else:
+        imgui.text_colored(DIM, "Number of repeats: only used by Repeated Grouped CV")
+    imgui.set_next_item_width(120)
+    changed, value = imgui.input_float("Confidence level (%)", float(STATE.confidence_level))
+    if changed:
+        STATE.confidence_level = min(max(value, 50.0), 99.9)
+    imgui.set_next_item_width(120)
+    changed, value = imgui.input_int("Random seed", int(STATE.random_state))
+    if changed:
+        STATE.random_state = value
+
+    changed, STATE.single_target_mode = imgui.checkbox(
+        "Single-target publication mode", STATE.single_target_mode)
+    if changed and STATE.single_target_mode:
+        _sync_validation_column_defaults(STATE.coltype_columns)
+    if STATE.single_target_mode:
+        candidates = [c for c in STATE.coltype_columns
+                      if STATE.coltype_role.get(c) == "target"]
+        if not candidates:
+            candidates = _split_cols(STATE.target_columns)
+        if STATE.single_target and STATE.single_target not in candidates:
+            candidates.append(STATE.single_target)
+        if candidates:
+            target_idx = candidates.index(STATE.single_target) if STATE.single_target in candidates else 0
+            imgui.set_next_item_width(260)
+            changed, target_idx = imgui.combo("Publication target", target_idx, candidates)
+            if changed or not STATE.single_target:
+                STATE.single_target = candidates[target_idx]
+        else:
+            imgui.text_colored(RED, "Choose exactly one target in the Column types tab.")
+
+    imgui.set_next_item_width(120)
+    changed, value = imgui.input_int(
+        "Show only top N features in importance plots", int(STATE.top_feature_count))
+    if changed:
+        STATE.top_feature_count = max(1, value)
+
+    imgui.dummy(imgui.ImVec2(0, 6))
+    imgui.text("4) Train")
+    imgui.text_colored(DIM, "Imputation and one-hot encoding are fitted inside every CV fold.")
     # Guard clicks while a run is in progress.
     if imgui.button("Train model", size=imgui.ImVec2(140, 0)):
         start_training()
@@ -2399,23 +3125,69 @@ def draw_train_tab():
         imgui.text_colored(GREEN, STATE.summary)
 
         imgui.dummy(imgui.ImVec2(0, 4))
-        imgui.text("Per-target performance (in-sample train vs 5-fold CV)")
-        flags = imgui.TableFlags_.borders | imgui.TableFlags_.row_bg
-        if imgui.begin_table("metrics", 5, flags):
-            for h in ("Target", "Train R2", "Train RMSE", "CV R2", "CV RMSE"):
+        imgui.text("Per-target performance (fold uncertainty and pooled OOF diagnostics)")
+        flags = (imgui.TableFlags_.borders | imgui.TableFlags_.row_bg
+                 | imgui.TableFlags_.scroll_x)
+        if imgui.begin_table("metrics", 9, flags, outer_size=imgui.ImVec2(0, 180)):
+            interval_label = f"{STATE.validation_config['confidence_level'] * 100:g}% interval"
+            for h in ("Target", "CV R2 mean +/- SD", "R2 " + interval_label,
+                      "CV RMSE mean +/- SD", "RMSE " + interval_label,
+                      "CV MAE mean +/- SD", "MAE " + interval_label,
+                      "Train R2", "Train RMSE"):
                 imgui.table_setup_column(h)
             imgui.table_headers_row()
-            for name, tr_r2, tr_rmse, cv_r2, cv_rmse in STATE.metrics:
+            for metric in STATE.metrics:
+                name = metric["target"]
+                summaries = metric["cv"]
                 imgui.table_next_row()
                 imgui.table_next_column(); imgui.text(name)
-                imgui.table_next_column(); imgui.text(f"{tr_r2:.4f}")
-                imgui.table_next_column(); imgui.text(f"{tr_rmse:.4f}")
-                # Colour CV R2 by quality; a big train-vs-CV gap flags overfitting.
-                imgui.table_next_column()
-                imgui.text_colored(GREEN if cv_r2 >= 0.5 else (RED if cv_r2 < 0 else DIM),
-                                   f"{cv_r2:.4f}")
-                imgui.table_next_column(); imgui.text(f"{cv_rmse:.4f}")
+                for key in ("r2", "rmse", "mae"):
+                    summary = summaries[key]
+                    imgui.table_next_column()
+                    imgui.text(f"{summary['mean']:.4f} +/- {summary['std']:.4f}")
+                    imgui.table_next_column()
+                    imgui.text(f"[{summary['lower']:.4f}, {summary['upper']:.4f}]")
+                imgui.table_next_column(); imgui.text(f"{metric['train_r2']:.4f}")
+                imgui.table_next_column(); imgui.text(f"{metric['train_rmse']:.4f}")
             imgui.end_table()
+
+        if STATE.metrics:
+            m = STATE.metrics[0]
+            group_text = (str(m["n_groups"]) if STATE.validation_config["method"] != "random_kfold"
+                          else "not applicable (rows are independent)")
+            imgui.text_wrapped(
+                f"Validation method: {m['validation_method']}  |  Rows: {m['n_rows']}  |  "
+                f"Independent groups: {group_text}  |  Folds: {m['n_splits']}  |  "
+                f"Repeats: {m['n_repeats']}"
+            )
+            if STATE.validation_config["method"] != "random_kfold":
+                imgui.text_colored(
+                    GREEN,
+                    "Group integrity check: passed - zero groups overlap between train and validation."
+                )
+            for metric in STATE.metrics:
+                pooled = metric["pooled_oof"]
+                imgui.text_wrapped(
+                    f"{metric['target']} pooled OOF: R2 {pooled['r2']:.4f}, "
+                    f"RMSE {pooled['rmse']:.4f}, MAE {pooled['mae']:.4f}."
+                )
+            imgui.text_colored(DIM, "Intervals above describe cross-validation uncertainty, "
+                               "not prediction intervals for individual recipes.")
+
+        if STATE.feature_diagnostics:
+            d = STATE.feature_diagnostics
+            imgui.separator()
+            imgui.text("Feature-count diagnostics")
+            imgui.text_wrapped(
+                f"Original selected predictors: {d['original_predictors']}  |  "
+                f"Encoded predictors: {d['encoded_predictors']}  |  "
+                f"Training rows: {d['training_rows']}  |  Independent groups: {d['independent_groups']}  |  "
+                f"Rows per encoded predictor: {d['rows_per_encoded_predictor']:.2f}  |  "
+                f"Groups per encoded predictor: {d['groups_per_encoded_predictor']:.2f}"
+            )
+            if STATE.show_feature_ratio_warnings:
+                for warning in d.get("warnings", []):
+                    imgui.text_colored(RED, warning)
 
         imgui.dummy(imgui.ImVec2(0, 4))
         imgui.text("Top 5 most influential features")
@@ -2439,17 +3211,19 @@ def draw_predict_tab():
     imgui.separator()
 
     if imgui.begin_child("inputs", imgui.ImVec2(0, 300)):
+        draw_chemical_inputs("pred")
+        hidden_chemistry = _chemistry_model_columns()
         # Parsed messy columns appear as ONE field each ('1M NaOH' style).
         consumed = draw_recipe_inputs("pred")
         for col in STATE.numeric_schema:
-            if col in consumed:
+            if col in consumed or col in hidden_chemistry:
                 continue
             changed, val = imgui.input_float(f"{feature_label(col)}##num_{col}",
                                              float(STATE.numeric_values[col]))
             if changed:
                 STATE.numeric_values[col] = val
         for col, choices in STATE.categorical_schema.items():
-            if col in consumed:
+            if col in consumed or col in hidden_chemistry:
                 continue
             changed, idx = imgui.combo(f"{feature_label(col)}##cat_{col}",
                                        STATE.category_index[col], choices)
@@ -2554,6 +3328,19 @@ def draw_coltypes_tab():
         STATE.json_dialog = None
     imgui.same_line()
     imgui.text_colored(DIM, "sets target / features / exclude from a spec file")
+    if imgui.button("Save JSON config...", size=imgui.ImVec2(170, 0)):
+        STATE.json_save_dialog = pfd.save_file(
+            "Save JSON config", "training_settings.json",
+            filters=["JSON", "*.json"])
+    if STATE.json_save_dialog is not None and STATE.json_save_dialog.ready():
+        result = STATE.json_save_dialog.result()
+        if result:
+            try:
+                path = result if str(result).lower().endswith(".json") else str(result) + ".json"
+                export_json_config(path)
+            except Exception as e:  # noqa: BLE001
+                STATE.coltype_status = f"JSON save failed: {e}"
+        STATE.json_save_dialog = None
 
     if not STATE.data_path and not STATE.coltype_columns:
         imgui.text_colored(DIM, "Choose a spreadsheet in the Train tab first, "
@@ -2655,7 +3442,7 @@ def draw_coltypes_tab():
 
 
 def draw_compare_tab():
-    imgui.text("Benchmark multiple architectures with 5-fold cross-validation")
+    imgui.text("Benchmark multiple architectures with the Train-tab validation settings")
     imgui.text_wrapped(
         "Uses the columns configured in the Train tab. Reports each model's average "
         "out-of-fold R2, RMSE, MAE, training R2 and prediction latency across every "
@@ -2668,7 +3455,21 @@ def draw_compare_tab():
         return
     imgui.text_colored(DIM, STATE.data_path)
 
-    if imgui.button("Run 5-fold comparison", size=imgui.ImVec2(220, 0)):
+    live_cfg = _validation_config_from_state()
+    summary = STATE.compare_validation_summary
+    label = summary.get("label", V.validation_method_label(live_cfg))
+    group_column = summary.get("group_column", live_cfg.get("group_column", ""))
+    folds = summary.get("n_splits", live_cfg["n_splits"])
+    repeats = summary.get("n_repeats", live_cfg["n_repeats"]
+                      if live_cfg["method"] == "repeated_grouped_cv" else 1)
+    imgui.text_colored(GREEN, f"Validation: {label}")
+    if live_cfg["method"] != "random_kfold":
+        imgui.text(f"Grouping column: {group_column or 'not selected'}")
+    imgui.text(f"{folds} folds x {repeats} repeats")
+    if summary:
+        imgui.text(f"Independent groups: {summary['n_groups']}")
+
+    if imgui.button("Run model comparison", size=imgui.ImVec2(220, 0)):
         start_comparison()
 
     # Progress: fraction of models completed.
@@ -2685,19 +3486,25 @@ def draw_compare_tab():
     if STATE.compare_results:
         imgui.separator()
         imgui.text("Ranking (highest average CV R2 first)")
-        flags = imgui.TableFlags_.borders | imgui.TableFlags_.row_bg
-        if imgui.begin_table("compare", 7, flags):
-            for h in ("#", "Model", "CV R2", "CV RMSE", "CV MAE",
-                      "Train R2", "Predict"):
+        flags = (imgui.TableFlags_.borders | imgui.TableFlags_.row_bg
+                 | imgui.TableFlags_.scroll_x)
+        if imgui.begin_table("compare", 11, flags, outer_size=imgui.ImVec2(0, 260)):
+            confidence = live_cfg["confidence_level"] * 100
+            for h in ("#", "Model", "Mean CV R2", f"R2 {confidence:g}% interval",
+                      "Mean CV RMSE", f"RMSE {confidence:g}% interval", "Mean CV MAE",
+                      f"MAE {confidence:g}% interval", "Train R2", "Runtime",
+                      "Prediction latency"):
                 imgui.table_setup_column(h)
             imgui.table_headers_row()
             ranked = sorted(
                 STATE.compare_results,
-                key=lambda r: (r[1] if r[1] == r[1] else -1e9),  # NaN sinks to bottom
+                key=lambda r: r.get("r2", {}).get("mean", -1e9),
                 reverse=True,
             )
             for rank, row in enumerate(ranked, start=1):
-                name, score, secs, rmse, mae, train_r2, predict_ms = row
+                name = row["name"]
+                r2s, rmses, maes = row.get("r2"), row.get("rmse"), row.get("mae")
+                score = r2s["mean"] if r2s else float("nan")
                 imgui.table_next_row()
                 imgui.table_next_column(); imgui.text(str(rank))
                 imgui.table_next_column()
@@ -2710,14 +3517,25 @@ def draw_compare_tab():
                     GREEN if score == score and score >= 0.5 else
                     (RED if score != score or score < 0 else DIM),
                     "FAILED" if score != score else f"{score:.4f}")
-                imgui.table_next_column(); imgui.text("-" if rmse != rmse else f"{rmse:.3f}")
-                imgui.table_next_column(); imgui.text("-" if mae != mae else f"{mae:.3f}")
+                imgui.table_next_column(); imgui.text(
+                    "-" if not r2s else f"[{r2s['lower']:.3f}, {r2s['upper']:.3f}]")
+                imgui.table_next_column(); imgui.text("-" if not rmses else f"{rmses['mean']:.3f}")
+                imgui.table_next_column(); imgui.text(
+                    "-" if not rmses else f"[{rmses['lower']:.3f}, {rmses['upper']:.3f}]")
+                imgui.table_next_column(); imgui.text("-" if not maes else f"{maes['mean']:.3f}")
+                imgui.table_next_column(); imgui.text(
+                    "-" if not maes else f"[{maes['lower']:.3f}, {maes['upper']:.3f}]")
                 imgui.table_next_column()
+                train_r2 = row.get("train_r2", float("nan"))
                 imgui.text("-" if train_r2 != train_r2 else f"{train_r2:.4f}")
                 imgui.table_next_column()
+                runtime = row.get("runtime", float("nan"))
+                imgui.text("-" if runtime != runtime else f"{runtime:.2f} s")
+                imgui.table_next_column()
+                predict_ms = row.get("predict_ms", float("nan"))
                 imgui.text("-" if predict_ms != predict_ms else f"{predict_ms:.2f} ms/row")
             imgui.end_table()
-            imgui.text_colored(DIM, "CV = 5-fold cross-validation (out-of-fold). "
+            imgui.text_colored(DIM, "Models are ranked by mean cross-validation R2. "
                                "A large Train-vs-CV R2 gap signals overfitting. "
                                "Predict = average latency per row.")
         if STATE.compare_chart_path:
@@ -2828,6 +3646,8 @@ def draw_optimize_tab():
                            f"Predicted {r['target']} = {r['predicted']:.0f}   "
                            f"(observed {r['obs_min']:.0f}–{r['obs_max']:.0f})")
         imgui.text_colored(DIM, f"Model 5-fold R² = {r['r2']:.2f} — treat as a hypothesis to test.")
+        if r.get("optimized_over"):
+            imgui.text_colored(DIM, "Search basis: " + r["optimized_over"] + ".")
         if r["edges"]:
             imgui.text_colored((0.9, 0.7, 0.2, 1.0),
                                "Extrapolation risk (knob at edge of data): "
@@ -2851,6 +3671,36 @@ def draw_optimize_tab():
                 imgui.table_next_column()
                 imgui.text(f"{val:g}" if isinstance(val, float) else str(val))
             imgui.end_table()
+
+        if r.get("chemical_recommendations"):
+            imgui.dummy(imgui.ImVec2(0, 4))
+            imgui.text("Chemically feasible reagent mapping")
+            imgui.text_colored(
+                DIM,
+                "The search operates on descriptors; these are the closest known reagents."
+            )
+            flags = imgui.TableFlags_.borders | imgui.TableFlags_.row_bg
+            if imgui.begin_table("chemical_mapping", 4, flags):
+                imgui.table_setup_column("Input")
+                imgui.table_setup_column("Recommended")
+                imgui.table_setup_column("Profile match")
+                imgui.table_setup_column("Alternatives")
+                imgui.table_headers_row()
+                for item in r["chemical_recommendations"]:
+                    alternatives = ", ".join(
+                        f"{alt['name']} ({alt['score']:.2f})"
+                        for alt in item.get("alternatives", [])
+                    ) or "None"
+                    imgui.table_next_row()
+                    imgui.table_next_column()
+                    imgui.text(str(item["column"]))
+                    imgui.table_next_column()
+                    imgui.text(str(item["recommended"]))
+                    imgui.table_next_column()
+                    imgui.text(f"{item['similarity']:.2f}")
+                    imgui.table_next_column()
+                    imgui.text_wrapped(alternatives)
+                imgui.end_table()
 
 
 def _show_chart_image(rel_path):
@@ -2943,16 +3793,36 @@ def draw_charts_tab():
         STATE.charts_featy_idx = clamp(STATE.charts_featy_idx, numeric_feats)
         _, STATE.charts_featy_idx = imgui.combo("Heatmap Y", STATE.charts_featy_idx, numeric_feats)
     imgui.set_next_item_width(180)
-    _, STATE.charts_imp_top_idx = imgui.combo(
-        "Feature importance", STATE.charts_imp_top_idx,
-        ["Top 5", "Top 10", "Top 20", "All features"])
+    changed, value = imgui.input_int(
+        "Top features in importance plots", int(STATE.top_feature_count))
+    if changed:
+        STATE.top_feature_count = max(1, value)
+
+    # Poll the async slideshow save dialog.
+    if STATE.slideshow_dialog is not None and STATE.slideshow_dialog.ready():
+        r = STATE.slideshow_dialog.result()
+        if r:
+            export_slideshow(r)
+        STATE.slideshow_dialog = None
 
     imgui.dummy(imgui.ImVec2(0, 4))
     if imgui.button("Generate charts", size=imgui.ImVec2(200, 0)):
         start_charts()
+    have_charts = bool(STATE.chart_items or STATE.lat_chart_items or STATE.intel_chart_items)
+    if have_charts:
+        imgui.same_line()
+        if imgui.button("Create slideshow summary", size=imgui.ImVec2(220, 0)):
+            STATE.slideshow_dialog = pfd.save_file(
+                "Save slideshow summary", "BioCarbon_summary_slideshow.pdf",
+                filters=["PDF", "*.pdf"])
+        imgui.same_line()
+        imgui.text_colored(DIM, "narrated PDF: one slide per chart + a conclusion")
     imgui.text_colored(RED if STATE.charts_error else DIM, STATE.charts_status)
     if STATE.charts_error:
         imgui.text_wrapped(STATE.charts_error)
+    if STATE.slideshow_status:
+        imgui.text_colored(GREEN if "Saved" in STATE.slideshow_status else RED,
+                           STATE.slideshow_status)
 
     if STATE.chart_items:
         imgui.separator()
@@ -3261,10 +4131,12 @@ def _screen_inputs_panel():
     imgui.same_line()
     imgui.text_colored(DIM, "(edit to run a what-if)")
     if imgui.begin_child("screen_inputs", imgui.ImVec2(0, 0)):
+        draw_chemical_inputs("screen", mark_dirty=True)
+        hidden_chemistry = _chemistry_model_columns()
         # Parsed messy columns appear as ONE field each ('1M NaOH' style).
         consumed = draw_recipe_inputs("scr", mark_dirty=True)
         for col in STATE.numeric_schema:
-            if col in consumed:
+            if col in consumed or col in hidden_chemistry:
                 continue
             changed, val = imgui.input_float(f"{feature_label(col)}##snum_{col}",
                                              float(STATE.numeric_values[col]))
@@ -3272,7 +4144,7 @@ def _screen_inputs_panel():
                 STATE.numeric_values[col] = val
                 STATE.screen_dirty = True
         for col, choices in STATE.categorical_schema.items():
-            if col in consumed:
+            if col in consumed or col in hidden_chemistry:
                 continue
             STATE.category_index[col] = min(STATE.category_index.get(col, 0),
                                             max(len(choices) - 1, 0))
@@ -3384,6 +4256,34 @@ def _draw_screen_result(res, scr):
                 imgui.text_colored(RED, "  ⚠ " + f)
         if res["missing"]:
             imgui.text_colored(ORANGE, "  ⚠ Unspecified: " + ", ".join(res["missing"][:6]))
+
+        if res.get("chemistry"):
+            imgui.dummy(imgui.ImVec2(0, 3))
+            imgui.text_colored(BLUE, "Chemical descriptor evidence")
+            for evidence in res["chemistry"]:
+                imgui.text_wrapped(
+                    f"  {evidence['column']}: {evidence['original']} → {evidence['summary']} "
+                    f"Descriptor confidence {evidence['descriptor_confidence']:.2f}."
+                )
+                nearest = ", ".join(
+                    f"{item['name']} {item['score']:.2f}" for item in evidence["similarities"])
+                imgui.text_colored(DIM, f"    Similarity to known chemicals: {nearest}")
+                descriptors = evidence.get("descriptors", {})
+                central = []
+                for key in ("Strong acid", "Strong base", "pKa", "Molecular weight",
+                            "Contains chloride", "Hydroxide", "Oxidation tendency"):
+                    value = descriptors.get(key)
+                    if isinstance(value, float) and not np.isfinite(value):
+                        continue
+                    central.append(f"{key}={value}")
+                if central:
+                    imgui.text_colored(DIM, "    " + "  |  ".join(central))
+                if not evidence["exactly_observed"]:
+                    imgui.text_colored(
+                        ORANGE,
+                        "    Prediction confidence reduced because this exact chemical "
+                        "was not observed during training."
+                    )
 
         # --- Model quality ---
         cvr2 = mq["cv_r2"]
@@ -3642,6 +4542,124 @@ def draw_priority_tab():
             imgui.end_table()
 
 
+def _refresh_chemical_knowledge():
+    values = []
+    for info in STATE.chemistry_schema.get("columns", {}).values():
+        values.extend(info.get("observed_chemicals", []))
+    STATE.chemical_knowledge = chemistry.ENGINE.knowledge_for_values(values)
+
+
+def draw_chemical_knowledge_tab():
+    imgui.text("Chemical Knowledge Engine")
+    imgui.text_wrapped(
+        "Original reagent names are retained for reporting, while model training uses "
+        "formula, functional-class, elemental, physicochemical and optional RDKit descriptors."
+    )
+    imgui.separator()
+    _, STATE.chemistry_enabled = imgui.checkbox(
+        "Enable chemistry-aware feature engineering", STATE.chemistry_enabled)
+    changed, pubchem_enabled = imgui.checkbox(
+        "Allow PubChem lookup for unrecognized names (internet)",
+        STATE.chemistry_pubchem_enabled)
+    if changed:
+        STATE.chemistry_pubchem_enabled = pubchem_enabled
+        chemistry.ENGINE.generator.set_pubchem_enabled(pubchem_enabled)
+        _refresh_chemical_knowledge()
+    imgui.text_colored(
+        DIM,
+        "PubChem is optional and cached; formula and lookup fallbacks always work offline."
+    )
+    imgui.text_colored(
+        GREEN if chemistry.ENGINE.generator.rdkit.available else DIM,
+        "RDKit: available (molecular descriptors + Morgan fingerprints)"
+        if chemistry.ENGINE.generator.rdkit.available
+        else "RDKit: unavailable - internal lookup and formula heuristics remain active"
+    )
+    if imgui.button("Scan loaded dataset", size=imgui.ImVec2(180, 0)):
+        scan_chemical_knowledge()
+    imgui.same_line()
+    imgui.text_colored(DIM, STATE.chemistry_status)
+    if not STATE.chemical_knowledge:
+        imgui.text_wrapped(
+            "No chemicals are listed yet. Load a dataset and scan it, or train once "
+            "to populate the exact chemistry schema used by the model."
+        )
+        return
+
+    imgui.text("Original chemical  →  Expanded descriptor summary")
+    flags = imgui.TableFlags_.borders | imgui.TableFlags_.row_bg | imgui.TableFlags_.scroll_y
+    if imgui.begin_table("chemical_overview", 6, flags, outer_size=imgui.ImVec2(0, 190)):
+        for header in ("Original", "Resolved as", "Class", "MW", "pKa", "Confidence"):
+            imgui.table_setup_column(header)
+        imgui.table_headers_row()
+        for item in STATE.chemical_knowledge:
+            descriptor = item["descriptor"]
+            imgui.table_next_row()
+            imgui.table_next_column(); imgui.text(item["original"])
+            imgui.table_next_column(); imgui.text(descriptor.canonical_name)
+            imgui.table_next_column(); imgui.text(descriptor.categorical["ChemicalClass"])
+            mw = descriptor.numeric["MolecularWeight"]
+            imgui.table_next_column(); imgui.text("n/a" if not np.isfinite(mw) else f"{mw:.3f}")
+            pka = descriptor.numeric["pKa"]
+            imgui.table_next_column(); imgui.text("n/a" if not np.isfinite(pka) else f"{pka:g}")
+            imgui.table_next_column(); imgui.text(f"{descriptor.confidence:.2f}")
+        imgui.end_table()
+
+    names = [item["original"] for item in STATE.chemical_knowledge]
+    STATE.chemistry_selected_idx = min(STATE.chemistry_selected_idx, len(names) - 1)
+    imgui.set_next_item_width(280)
+    changed, STATE.chemistry_selected_idx = imgui.combo(
+        "Inspect / edit chemical", STATE.chemistry_selected_idx, names)
+    selected = STATE.chemical_knowledge[STATE.chemistry_selected_idx]
+    descriptor = chemistry.ENGINE.generator.describe(selected["original"])
+    similarities = chemistry.ENGINE.generator.similarities(selected["original"], top=3)
+    imgui.text_wrapped(
+        f"{descriptor.categorical['ChemicalClass']} · source: {descriptor.source} · "
+        f"descriptor confidence {descriptor.confidence:.2f}"
+    )
+    imgui.text("Nearest known chemistry: " + ", ".join(
+        f"{item.name} ({item.score:.2f})" for item in similarities))
+    if imgui.small_button("Reset manual edits for this chemical"):
+        chemistry.ENGINE.generator.clear_override(selected["original"])
+        _refresh_chemical_knowledge()
+        descriptor = chemistry.ENGINE.generator.describe(selected["original"])
+
+    central_numeric = [
+        "Is_Acid", "Is_Base", "Is_Strong_Acid", "Is_Weak_Acid",
+        "Is_Strong_Base", "Is_Weak_Base", "Is_Oxidizer", "Is_Reducing_Agent",
+        "Is_Chelating_Agent", "Is_Transition_Metal_Salt", "Contains_Hydroxide",
+        "Contains_Chloride", "Contains_Sulfate", "Contains_Nitrate",
+        "pKa", "pKb", "MolecularWeight", "EstimatedIonicCharge",
+        "EstimatedAcidity", "EstimatedBasicity", "EstimatedOxidationTendency",
+        "EstimatedReductionTendency", "WaterSoluble", "Organic", "Inorganic",
+    ]
+    if imgui.begin_child("chemical_descriptor_editor", imgui.ImVec2(0, 0)):
+        imgui.text_colored(DIM, "Manual edits are cached and included in settings/model exports.")
+        overrides = dict(chemistry.ENGINE.generator.overrides.get(
+            chemistry.normalize_chemical_key(selected["original"]), {}))
+        for key in central_numeric:
+            current = float(descriptor.numeric.get(key, math.nan))
+            display = current if np.isfinite(current) else 0.0
+            imgui.set_next_item_width(180)
+            changed, value = imgui.input_float(chemistry.descriptor_display_name(key), display)
+            if changed:
+                overrides[key] = float(value)
+                chemistry.ENGINE.generator.set_override(selected["original"], overrides)
+                _refresh_chemical_knowledge()
+                descriptor = chemistry.ENGINE.generator.describe(selected["original"])
+        for key in ("ChemicalClass", "Metal", "Halogen", "AnionType", "CationType",
+                    "IonicStrengthClass", "Corrosiveness"):
+            imgui.set_next_item_width(260)
+            changed, value = imgui.input_text(
+                chemistry.descriptor_display_name(key), descriptor.categorical.get(key, "None"))
+            if changed:
+                overrides[key] = value
+                chemistry.ENGINE.generator.set_override(selected["original"], overrides)
+                _refresh_chemical_knowledge()
+                descriptor = chemistry.ENGINE.generator.describe(selected["original"])
+    imgui.end_child()
+
+
 def gui():
     """Top-level GUI callback — called every frame by imgui-bundle."""
     imgui.text("🌿 BioCarbon Screen — AI-assisted hard-carbon synthesis screening")
@@ -3668,6 +4686,9 @@ def gui():
             imgui.end_tab_item()
         if imgui.begin_tab_item("Column types")[0]:
             draw_coltypes_tab()
+            imgui.end_tab_item()
+        if imgui.begin_tab_item("Chemical Knowledge")[0]:
+            draw_chemical_knowledge_tab()
             imgui.end_tab_item()
         if imgui.begin_tab_item("Compare models")[0]:
             draw_compare_tab()

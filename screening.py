@@ -30,6 +30,7 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import NearestNeighbors
+import chemistry_features as chemistry
 
 RANDOM_STATE = 42
 
@@ -127,7 +128,8 @@ class Screener:
 
     def __init__(self, model, feature_columns, numeric_schema, categorical_schema,
                  targets, X_train, y_train, cv_rmse=None, cv_r2=None,
-                 display_labels=None):
+                 display_labels=None, chemistry_schema=None,
+                 chemistry_originals=None):
         self.model = model
         self.feature_columns = list(feature_columns)
         self._col_index = {c: i for i, c in enumerate(self.feature_columns)}
@@ -137,6 +139,7 @@ class Screener:
         # Display names for internal feature columns (e.g. the app's parsed
         # messy-column parts: numeric_feature_A1 -> "Pretreat 1: number/percent").
         self.labels = {str(k): str(v) for k, v in (display_labels or {}).items()}
+        self.chemistry_schema = dict(chemistry_schema or {})
 
         self.X_train = X_train[self.feature_columns].astype(float)
         self.y_train = y_train.reset_index(drop=True)
@@ -146,6 +149,11 @@ class Screener:
         # Raw (human-readable) view of every training experiment.
         self.train_raw = reconstruct_raw(self.X_train, self.numeric_schema,
                                          self.categorical_schema).reset_index(drop=True)
+        if chemistry_originals is not None:
+            originals = pd.DataFrame(chemistry_originals).reset_index(drop=True)
+            if len(originals) == len(self.train_raw):
+                for column in originals:
+                    self.train_raw[column] = originals[column]
 
         # Observed numeric ranges (for out-of-range warnings + PD sweeps).
         self.numeric_ranges = {}
@@ -185,6 +193,8 @@ class Screener:
     # ---- internals ---------------------------------------------------------
     def _extract_forests(self):
         """Return {target: fitted forest} when the model exposes per-tree access."""
+        if len(self.targets) == 1 and hasattr(self.model, "feature_importances_"):
+            return {self.targets[0]: self.model}
         forests = {}
         subs = getattr(self.model, "estimators_", None)
         if subs is not None and len(subs) == len(self.targets):
@@ -194,6 +204,12 @@ class Screener:
 
     def _global_importance(self):
         agg = {}
+        if len(self.targets) == 1 and hasattr(self.model, "feature_importances_"):
+            imp = np.asarray(self.model.feature_importances_, dtype=float)
+            for col, value in zip(self.feature_columns, imp):
+                original = self.orig_map[col]
+                agg[original] = agg.get(original, 0.0) + float(value)
+            return sorted(agg.items(), key=lambda kv: kv[1], reverse=True)
         subs = getattr(self.model, "estimators_", None)
         if subs is None:
             return []
@@ -205,6 +221,10 @@ class Screener:
             agg[self.orig_map[col]] = agg.get(self.orig_map[col], 0.0) + float(v)
         return sorted(agg.items(), key=lambda kv: kv[1], reverse=True)
 
+    def _predict_2d(self, X):
+        pred = np.asarray(self.model.predict(X), dtype=float)
+        return pred.reshape(-1, 1) if pred.ndim == 1 else pred
+
     def encode(self, raw):
         """Turn a {feature: value} dict into a model-aligned 1-row float frame.
 
@@ -214,13 +234,15 @@ class Screener:
         value that happens to look like another column can't create duplicate
         labels, and an unknown/baseline category simply leaves its dummies at 0.
         """
+        raw = self._chemistry_expanded_raw(raw)
         x = np.zeros(len(self.feature_columns), dtype=float)
         for c, med in self.numeric_schema.items():
             i = self._col_index.get(c)
             if i is None:
                 continue
             try:
-                x[i] = float(raw.get(c, med))
+                value = float(raw.get(c, med))
+                x[i] = value if np.isfinite(value) else med
             except (TypeError, ValueError):
                 x[i] = med
         for c in self.categorical_schema:
@@ -231,6 +253,22 @@ class Screener:
                 x[i] = 1.0
         return pd.DataFrame([x], columns=self.feature_columns)
 
+    def _chemistry_expanded_raw(self, raw):
+        """Return a row with model descriptors derived from reagent labels.
+
+        Direct descriptor values are retained when present.  This lets
+        sensitivity analysis sweep a descriptor while ordinary prediction and
+        imported candidate files can supply only the human-readable chemical.
+        """
+        supplied = dict(raw or {})
+        if not self.chemistry_schema.get("columns"):
+            return supplied
+        expanded = chemistry.ENGINE.expand_row(supplied, self.chemistry_schema)
+        expanded.update({key: supplied[key] for key in supplied if key in expanded})
+        merged = dict(supplied)
+        merged.update(expanded)
+        return merged
+
     # ---- 1. prediction + uncertainty --------------------------------------
     def uncertainty(self, X_enc):
         """
@@ -239,7 +277,7 @@ class Screener:
         validated residual error (aleatoric).
         """
         out = {}
-        point = self.model.predict(X_enc)[0]
+        point = self._predict_2d(X_enc)[0]
         for i, t in enumerate(self.targets):
             mean = float(point[i])
             forest = self._forests.get(t)
@@ -326,7 +364,11 @@ class Screener:
         for dist, j in zip(d[0], idx[0]):
             sim = 100.0 * float(np.exp(-dist / self._d_ref))
             measured = {t: float(self.y_train.iloc[j][t]) for t in self.targets}
-            conditions = {c: self.train_raw.iloc[j][c] for c in self.train_raw.columns}
+            hidden = set(self.chemistry_schema.get("interactions", []))
+            for info in self.chemistry_schema.get("columns", {}).values():
+                hidden.update(info.get("descriptor_columns", []))
+            conditions = {c: self.train_raw.iloc[j][c] for c in self.train_raw.columns
+                          if c not in hidden}
             rows.append({"index": int(j), "distance": float(dist),
                          "similarity": max(0.0, min(100.0, sim)),
                          "measured": measured, "conditions": conditions})
@@ -366,7 +408,7 @@ class Screener:
             except Exception:
                 contribs = {}
         if not contribs:                       # perturbation fallback
-            full = float(self.model.predict(X_enc)[0][i])
+            full = float(self._predict_2d(X_enc)[0][i])
             base = full
             for o in set(self.orig_map.values()):
                 pert = X_enc.copy()
@@ -375,7 +417,7 @@ class Screener:
                 else:
                     for d in [c for c in self.feature_columns if self.orig_map[c] == o]:
                         pert[d] = 0.0
-                delta = full - float(self.model.predict(pert)[0][i])
+                delta = full - float(self._predict_2d(pert)[0][i])
                 contribs[o] = delta
         ranked = sorted(contribs.items(), key=lambda kv: abs(kv[1]), reverse=True)
         return {"base": base, "contributions": ranked[:top]}
@@ -389,19 +431,26 @@ class Screener:
             grid = np.linspace(lo, hi, n)
             for g in grid:
                 r = dict(raw); r[feature] = g
-                ys_out.append(float(self.model.predict(self.encode(r))[0][i]))
+                ys_out.append(float(self._predict_2d(self.encode(r))[0][i]))
                 xs_out.append(float(g))
         else:
             for lvl in self.categorical_schema.get(feature, []):
                 r = dict(raw); r[feature] = lvl
-                ys_out.append(float(self.model.predict(self.encode(r))[0][i]))
+                ys_out.append(float(self._predict_2d(self.encode(r))[0][i]))
                 xs_out.append(lvl)
         return xs_out, ys_out
 
     def sensitivity(self, raw, target, top=8):
         """How much the prediction swings as each feature spans its range."""
         rows = []
-        feats = list(self.numeric_schema.keys()) + list(self.categorical_schema.keys())
+        all_features = list(self.numeric_schema.keys()) + list(self.categorical_schema.keys())
+        importance_order = [feature for feature, _ in self.importance
+                            if feature in all_features]
+        remaining = [feature for feature in all_features if feature not in importance_order]
+        # Chemistry expansion can add many descriptors.  Sweep the strongest
+        # global candidates plus a bounded fallback rather than blocking the UI
+        # with thousands of near-zero what-if predictions.
+        feats = (importance_order + remaining)[:max(18, top * 3)]
         for f in feats:
             try:
                 _, ys = self.partial_dependence(raw, f, target, n=12)
@@ -541,24 +590,111 @@ class Screener:
                 "ranking": rank, "color": VERDICTS[verdict]}
 
     # ---- 7. the whole workflow in one call --------------------------------
+    def chemical_evidence(self, raw):
+        """Explain chemical inference and quantify unseen-reagent confidence."""
+        evidence = []
+        for source, info in self.chemistry_schema.get("columns", {}).items():
+            value = str(raw.get(source, "Unknown"))
+            descriptor = chemistry.ENGINE.generator.describe(value)
+            observed = list(map(str, info.get("observed_chemicals", [])))
+            norm = lambda text: "".join(ch.lower() for ch in str(text) if ch.isalnum())
+            identity = {norm(value), norm(descriptor.canonical_name), norm(descriptor.formula)}
+            identity.discard("")
+            exact_seen = False
+            for candidate in observed:
+                known = chemistry.ENGINE.generator.describe(candidate)
+                candidate_identity = {
+                    norm(candidate), norm(known.canonical_name), norm(known.formula)}
+                if identity & (candidate_identity - {""}):
+                    exact_seen = True
+                    break
+            similarities = chemistry.ENGINE.generator.similarities(value, top=3)
+            adjustment = (1.0 if exact_seen and descriptor.confidence >= .75
+                          else max(.50, descriptor.confidence * .85))
+            chemical_class = descriptor.categorical.get("ChemicalClass", "Unknown")
+            if descriptor.numeric.get("Is_Mineral_Acid", 0):
+                chemical_class += " (mineral acid)"
+            class_phrase = chemical_class.lower().replace(
+                "strong acid (mineral acid)", "strong mineral acid")
+            inferred = descriptor.source != "lookup"
+            descriptor_values = {
+                "Strong acid": bool(descriptor.numeric.get("Is_Strong_Acid", 0)),
+                "Strong base": bool(descriptor.numeric.get("Is_Strong_Base", 0)),
+                "pKa": descriptor.numeric.get("pKa"),
+                "pKb": descriptor.numeric.get("pKb"),
+                "Molecular weight": descriptor.numeric.get("MolecularWeight"),
+                "Contains chloride": bool(descriptor.numeric.get("Contains_Chloride", 0)),
+                "Hydroxide": bool(descriptor.numeric.get("Contains_Hydroxide", 0)),
+                "Oxidation tendency": descriptor.numeric.get(
+                    "EstimatedOxidationTendency"),
+                "Reduction tendency": descriptor.numeric.get(
+                    "EstimatedReductionTendency"),
+                "Ionic strength class": descriptor.categorical.get(
+                    "IonicStrengthClass", "Unknown"),
+                "Corrosiveness": descriptor.categorical.get("Corrosiveness", "Unknown"),
+            }
+            evidence.append({
+                "column": source, "original": value,
+                "canonical_name": descriptor.canonical_name,
+                "class": chemical_class, "source": descriptor.source,
+                "descriptor_confidence": descriptor.confidence,
+                "exactly_observed": exact_seen,
+                "prediction_confidence_adjustment": adjustment,
+                "similarities": [{"name": item.name, "score": item.score}
+                                 for item in similarities],
+                "descriptors": descriptor_values,
+                "notes": list(descriptor.notes),
+                "summary": (f"Known {class_phrase}." +
+                            (" Descriptors inferred." if inferred else "")),
+            })
+        return evidence
+
     def screen(self, raw, target, k_similar=6):
         """Run the full primary workflow for one recipe + target."""
         if target not in self.targets:
             raise ValueError(f"'{target}' is not a trained target.")
-        X_enc = self.encode(raw)
+        model_raw = self._chemistry_expanded_raw(raw)
+        X_enc = self.encode(model_raw)
         unc = self.uncertainty(X_enc)
         ad = self.applicability(X_enc)
-        ood = self.ood_flags(raw)
-        missing = self.missing_inputs(raw)
+        ood = self.ood_flags(model_raw)
+        chemical_evidence = self.chemical_evidence(raw)
+        if chemical_evidence:
+            chemistry_adjustment = min(
+                item["prediction_confidence_adjustment"] for item in chemical_evidence)
+            if chemistry_adjustment < .999:
+                prediction = unc[target]
+                prediction["sigma"] /= max(chemistry_adjustment, .35)
+                prediction["lo"] = prediction["mean"] - 1.96 * prediction["sigma"]
+                prediction["hi"] = prediction["mean"] + 1.96 * prediction["sigma"]
+                prediction["rel_width"] /= max(chemistry_adjustment, .35)
+                prediction["conf_raw"] = _confidence_from_relwidth(
+                    prediction["rel_width"], ad["in_domain"])
+                unseen = [item["original"] for item in chemical_evidence
+                          if not item["exactly_observed"]]
+                if unseen:
+                    ood.append(
+                        "Prediction confidence reduced because the exact chemical "
+                        f"was not observed during training: {', '.join(unseen)}."
+                    )
+                else:
+                    uncertain = [item["original"] for item in chemical_evidence
+                                 if item["prediction_confidence_adjustment"] < .999]
+                    ood.append(
+                        "Prediction confidence reduced because descriptor confidence "
+                        f"is limited for: {', '.join(uncertain)}."
+                    )
+        missing = self.missing_inputs(model_raw)
         sims = self.similar(X_enc, k=k_similar)
         rec = self.recommend(target, unc, ad, ood, sims, missing)
         contrib = self.contributions(X_enc, target)
-        effects = self.effect_summary(raw, target)
+        effects = self.effect_summary(model_raw, target)
         return {
             "target": target, "raw": dict(raw),
             "prediction": unc[target], "all_predictions": unc,
             "applicability": ad, "ood": ood, "missing": missing,
             "similar": sims, "recommendation": rec, "contributions": contrib,
+            "chemistry": chemical_evidence,
             "sensitivity": effects["sensitivity"],
             "effect_summary": effects["effects"],
             "partial_dependence": effects["partial_dependence"],

@@ -46,6 +46,7 @@ from xgboost import XGBRegressor
 from sklearn.model_selection import KFold, cross_val_predict
 from sklearn.metrics import r2_score
 from scipy.optimize import differential_evolution
+import chemistry_features as chemistry
 
 # =============================================================================
 # CONFIGURATION
@@ -92,6 +93,11 @@ def main():
 
     X_raw = df[controllable].copy()
     y = df[TARGET].values
+    chemistry_expansion = chemistry.ENGINE.transform(
+        X_raw, include_original=False, add_interactions=True)
+    chemistry_schema = chemistry_expansion.metadata
+    X_raw = chemistry_expansion.frame
+    controllable = list(X_raw.columns)
 
     # Split knobs into numeric (continuous ranges) and categorical (choices).
     numeric_cols, cat_choices = [], {}
@@ -105,6 +111,8 @@ def main():
             counts = X_raw[c].value_counts()
             cat_choices[c] = sorted(counts[counts >= MIN_SUPPORT].index.tolist()) \
                 or sorted(counts.index.tolist())
+    interaction_columns = set(chemistry_schema.get("interactions", []))
+    search_numeric_cols = [c for c in numeric_cols if c not in interaction_columns]
 
     # ---- Fit the predictive model + report honest CV R² --------------------
     X_enc = pd.get_dummies(X_raw, drop_first=False)
@@ -120,11 +128,12 @@ def main():
     # ---- Build the search space -------------------------------------------
     # numeric: bounded by the 1st–99th percentile (stay inside real experience)
     bounds, integrality, spec = [], [], []
-    for c in numeric_cols:
+    for c in search_numeric_cols:
         lo, hi = np.percentile(X_raw[c], 1), np.percentile(X_raw[c], 99)
         if lo == hi:
             hi = lo + 1e-6
-        bounds.append((lo, hi)); integrality.append(False)
+        bounds.append((lo, hi)); integrality.append(
+            chemistry.descriptor_is_discrete(c))
         spec.append(("num", c, col_pos.get(c)))
     for c, choices in cat_choices.items():
         bounds.append((0, len(choices) - 1)); integrality.append(True)
@@ -147,6 +156,12 @@ def main():
                 pos = s[2][i]
                 if pos is not None:
                     x[pos] = 1.0
+        for interaction in chemistry_schema.get("interaction_specs", []):
+            out = col_pos.get(interaction["feature"])
+            left = col_pos.get(interaction["left"])
+            right = col_pos.get(interaction["right"])
+            if out is not None and left is not None and right is not None:
+                x[out] = x[left] * x[right]
         return x
 
     def objective(vec):
@@ -178,12 +193,25 @@ def main():
     print("\n" + "=" * 60)
     print(f"  RECOMMENDED CONDITIONS to {DIRECTION} {TARGET}")
     print("=" * 60)
+    chemistry_columns = set(chemistry_schema.get("interactions", []))
+    for info in chemistry_schema.get("columns", {}).values():
+        chemistry_columns.update(info.get("descriptor_columns", []))
     for c in controllable:
+        if c in chemistry_columns:
+            continue
         val = best_row.iloc[0][c]
         if c in numeric_cols:
             print(f"  {c:<28} = {float(val):.3g}")
         else:
             print(f"  {c:<28} = {val}")
+    for source, info in chemistry_schema.get("columns", {}).items():
+        nearest = chemistry.ENGINE.nearest_known_profile(best, info["prefix"], top=3)
+        if nearest:
+            alternatives = ", ".join(f"{item.name} ({item.score:.2f})" for item in nearest[1:])
+            print(f"  {'Recommended ' + source:<28} = {nearest[0].name} "
+                  f"(descriptor similarity {nearest[0].score:.2f})")
+            if alternatives:
+                print(f"    alternatives: {alternatives}")
     print("-" * 60)
     print(f"  PREDICTED {TARGET} = {best_cap:.0f} mAh/g")
     print(f"  (best ever observed in data       = {y.max():.0f} mAh/g)")

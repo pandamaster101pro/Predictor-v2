@@ -17,6 +17,90 @@ import pandas as pd
 
 import charts as C
 import units
+import validation as V
+
+
+def _validation_rows(model_metadata):
+    """Flatten saved publication-validation metadata for PDF/Excel exports."""
+    meta = dict(model_metadata or {})
+    cfg = V.normalize_validation_config(meta.get("validation_config"))
+    diagnostics = dict(meta.get("feature_diagnostics") or {})
+    method = V.validation_method_label(cfg)
+    repeats = cfg["n_repeats"] if cfg["method"] == "repeated_grouped_cv" else 1
+    rows = [
+        ("Validation method", method),
+        ("Grouping column", cfg.get("group_column") or "Not applicable"),
+        ("Number of unique groups", diagnostics.get("independent_groups", "n/a")),
+        ("Number of folds", cfg["n_splits"]),
+        ("Number of repeats", repeats),
+        ("Confidence level", f"{cfg['confidence_level'] * 100:.1f}%"),
+        ("Random seed", cfg["random_state"]),
+        ("Preprocessing", meta.get("preprocessing") or "Scope not recorded"),
+    ]
+    for target_metric in meta.get("metrics", []):
+        if not isinstance(target_metric, dict):
+            continue
+        target = target_metric.get("target", "target")
+        for key, label in (("r2", "CV R2"), ("rmse", "CV RMSE"), ("mae", "CV MAE")):
+            summary = target_metric.get("cv", {}).get(key, {})
+            if summary:
+                rows.append((f"{target} - {label} mean +/- SD",
+                             f"{summary.get('mean', float('nan')):.4g} +/- "
+                             f"{summary.get('std', float('nan')):.4g}"))
+                rows.append((f"{target} - {label} interval",
+                             f"[{summary.get('lower', float('nan')):.4g}, "
+                             f"{summary.get('upper', float('nan')):.4g}]"))
+        pooled = target_metric.get("pooled_oof", {})
+        if pooled:
+            rows.append((f"{target} - pooled OOF metrics",
+                         f"R2={pooled.get('r2', float('nan')):.4g}; "
+                         f"RMSE={pooled.get('rmse', float('nan')):.4g}; "
+                         f"MAE={pooled.get('mae', float('nan')):.4g}"))
+    rows.extend([
+        ("Original selected predictors", diagnostics.get("original_predictors", "n/a")),
+        ("Encoded predictors", diagnostics.get("encoded_predictors", "n/a")),
+        ("Training rows", diagnostics.get("training_rows", "n/a")),
+        ("Rows per encoded predictor", diagnostics.get("rows_per_encoded_predictor", "n/a")),
+        ("Groups per encoded predictor", diagnostics.get("groups_per_encoded_predictor", "n/a")),
+    ])
+    if cfg["method"] != "random_kfold" and cfg.get("group_column"):
+        statement = (f"All rows sharing the same {cfg['group_column']} were assigned to "
+                     "the same cross-validation fold to prevent replicate leakage.")
+    else:
+        statement = "Rows were assigned using shuffled random K-fold cross-validation."
+    rows.append(("Methods statement", statement))
+    return rows
+
+
+def _chemistry_rows(result):
+    rows = []
+    for item in result.get("chemistry", []):
+        similarities = ", ".join(
+            f"{entry['name']} ({entry['score']:.2f})" for entry in item.get("similarities", []))
+        rows.extend([
+            (f"{item['column']} - original chemical", item["original"]),
+            (f"{item['column']} - resolved class", item["class"]),
+            (f"{item['column']} - descriptor source", item["source"]),
+            (f"{item['column']} - descriptor confidence",
+             f"{item['descriptor_confidence']:.2f}"),
+            (f"{item['column']} - exact chemical observed",
+             "Yes" if item["exactly_observed"] else "No"),
+            (f"{item['column']} - similarity to known chemicals", similarities or "n/a"),
+        ])
+        for name, value in item.get("descriptors", {}).items():
+            if isinstance(value, float) and pd.isna(value):
+                value = "n/a"
+            rows.append((f"{item['column']} - {name}", value))
+    return rows
+
+
+def _human_input_raw(result, screener):
+    """Hide internal descriptors while retaining original chemical labels."""
+    schema = dict(getattr(screener, "chemistry_schema", {}) or {})
+    hidden = set(schema.get("interactions", []))
+    for info in schema.get("columns", {}).values():
+        hidden.update(info.get("descriptor_columns", []))
+    return {key: value for key, value in result["raw"].items() if key not in hidden}
 
 
 # =============================================================================
@@ -70,7 +154,7 @@ def _interval_png(result, screener, path):
 # =============================================================================
 # PDF report  (reportlab)
 # =============================================================================
-def build_prediction_pdf(path, result, screener, model_summary=""):
+def build_prediction_pdf(path, result, screener, model_summary="", model_metadata=None):
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.units import mm
     from reportlab.lib import colors
@@ -134,6 +218,21 @@ def build_prediction_pdf(path, result, screener, model_summary=""):
     tb.setStyle(_kv_style(colors))
     story.append(tb)
 
+    if model_metadata:
+        story.append(Paragraph("Validation methodology", h2))
+        validation_table = Table([[str(k), str(v)] for k, v in _validation_rows(model_metadata)],
+                                 colWidths=[62 * mm, 108 * mm])
+        validation_table.setStyle(_kv_style(colors))
+        story.append(validation_table)
+
+    chemistry_rows = _chemistry_rows(result)
+    if chemistry_rows:
+        story.append(Paragraph("Chemical descriptors used", h2))
+        chemistry_table = Table([[str(k), str(v)] for k, v in chemistry_rows],
+                                colWidths=[62 * mm, 108 * mm])
+        chemistry_table.setStyle(_kv_style(colors))
+        story.append(chemistry_table)
+
     # --- Interval plot ---
     try:
         img = _interval_png(result, screener, os.path.join(tmpdir, "iv.png"))
@@ -179,7 +278,7 @@ def build_prediction_pdf(path, result, screener, model_summary=""):
     # --- Input conditions ---
     story.append(Paragraph("Input synthesis conditions", h2))
     rows = [["Variable", "Value"]]
-    for name, v in units.compose_grouped(result["raw"], screener.labels):
+    for name, v in units.compose_grouped(_human_input_raw(result, screener), screener.labels):
         rows.append([name, _fmt(v)])
     it = Table(rows, colWidths=[85 * mm, 85 * mm])
     it.setStyle(_grid_style(colors))
@@ -278,7 +377,7 @@ def _next_steps(result, screener):
 # =============================================================================
 # Excel report  (pandas + openpyxl)
 # =============================================================================
-def export_prediction_excel(path, result, screener):
+def export_prediction_excel(path, result, screener, model_metadata=None):
     t = result["target"]
     pred = result["prediction"]
     rec = result["recommendation"]
@@ -297,7 +396,7 @@ def export_prediction_excel(path, result, screener):
                   result["applicability"]["in_domain"],
                   mq["cv_r2"], mq["n_train"], mq["n_features"]],
     })
-    grouped = units.compose_grouped(result["raw"], screener.labels)
+    grouped = units.compose_grouped(_human_input_raw(result, screener), screener.labels)
     inputs = pd.DataFrame({"Variable": [n for n, _ in grouped],
                            "Value": [_fmt(v) for _, v in grouped]})
     reasons = pd.DataFrame({"Recommendation reasons": rec["reasons"]})
@@ -319,9 +418,14 @@ def export_prediction_excel(path, result, screener):
         row.update(s["conditions"])
         sim_rows.append(row)
     similar = pd.DataFrame(sim_rows)
+    validation = pd.DataFrame(_validation_rows(model_metadata), columns=["Field", "Value"])
+    chemistry_data = pd.DataFrame(_chemistry_rows(result), columns=["Field", "Value"])
 
     with pd.ExcelWriter(path, engine="openpyxl") as xl:
         summary.to_excel(xl, sheet_name="Summary", index=False)
+        validation.to_excel(xl, sheet_name="Validation", index=False)
+        if len(chemistry_data):
+            chemistry_data.to_excel(xl, sheet_name="Chemistry", index=False)
         inputs.to_excel(xl, sheet_name="Inputs", index=False)
         reasons.to_excel(xl, sheet_name="Recommendation", index=False)
         warnings.to_excel(xl, sheet_name="Warnings", index=False)
