@@ -326,8 +326,9 @@ def main(data_path):
     feature_cols = [c for c in df.columns if c not in TARGET_COLUMNS]
     X = df[feature_cols].copy()
     y = df[TARGET_COLUMNS].copy()
-    chemistry_expansion = chemistry.ENGINE.transform(
-        X, include_original=False, add_interactions=True)
+    chemistry_config = chemistry.ENGINE.auto_configure(
+        X, requested_mode="automatic")
+    chemistry_expansion = chemistry.ENGINE.transform(X, config=chemistry_config)
     X = chemistry_expansion.frame
     if chemistry_expansion.metadata.get("columns"):
         print(f"      Chemistry engine: expanded "

@@ -94,6 +94,26 @@ def _chemistry_rows(result):
     return rows
 
 
+def _chemistry_config_rows(model_metadata):
+    meta = dict(model_metadata or {})
+    config = dict(meta.get("chemistry_config") or {})
+    diagnostics = dict(meta.get("chemistry_feature_diagnostics") or {})
+    if not config and not diagnostics:
+        return []
+    rows = [
+        ("Chemistry feature mode", config.get("mode", "legacy")),
+        ("Chemistry feature budget", config.get("max_chemistry_features", "n/a")),
+        ("Candidate chemistry features", diagnostics.get("candidate_count", "n/a")),
+        ("Selected chemistry features", diagnostics.get("selected_count", "n/a")),
+        ("Dropped chemistry features", diagnostics.get("dropped_count", "n/a")),
+        ("Groups per chemistry feature",
+         diagnostics.get("groups_per_chemistry_feature", "n/a")),
+    ]
+    for index, reason in enumerate(config.get("rationale", diagnostics.get("rationale", [])), 1):
+        rows.append((f"Automatic rationale {index}", reason))
+    return rows
+
+
 def _human_input_raw(result, screener):
     """Hide internal descriptors while retaining original chemical labels."""
     schema = dict(getattr(screener, "chemistry_schema", {}) or {})
@@ -224,6 +244,13 @@ def build_prediction_pdf(path, result, screener, model_summary="", model_metadat
                                  colWidths=[62 * mm, 108 * mm])
         validation_table.setStyle(_kv_style(colors))
         story.append(validation_table)
+        chemistry_config_rows = _chemistry_config_rows(model_metadata)
+        if chemistry_config_rows:
+            story.append(Paragraph("Automatic chemistry configuration", h2))
+            config_table = Table([[str(k), str(v)] for k, v in chemistry_config_rows],
+                                 colWidths=[62 * mm, 108 * mm])
+            config_table.setStyle(_kv_style(colors))
+            story.append(config_table)
 
     chemistry_rows = _chemistry_rows(result)
     if chemistry_rows:
@@ -420,12 +447,17 @@ def export_prediction_excel(path, result, screener, model_metadata=None):
     similar = pd.DataFrame(sim_rows)
     validation = pd.DataFrame(_validation_rows(model_metadata), columns=["Field", "Value"])
     chemistry_data = pd.DataFrame(_chemistry_rows(result), columns=["Field", "Value"])
+    chemistry_config_data = pd.DataFrame(
+        _chemistry_config_rows(model_metadata), columns=["Field", "Value"])
 
     with pd.ExcelWriter(path, engine="openpyxl") as xl:
         summary.to_excel(xl, sheet_name="Summary", index=False)
         validation.to_excel(xl, sheet_name="Validation", index=False)
         if len(chemistry_data):
             chemistry_data.to_excel(xl, sheet_name="Chemistry", index=False)
+        if len(chemistry_config_data):
+            chemistry_config_data.to_excel(
+                xl, sheet_name="ChemistryConfig", index=False)
         inputs.to_excel(xl, sheet_name="Inputs", index=False)
         reasons.to_excel(xl, sheet_name="Recommendation", index=False)
         warnings.to_excel(xl, sheet_name="Warnings", index=False)

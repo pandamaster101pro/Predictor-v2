@@ -93,8 +93,9 @@ def main():
 
     X_raw = df[controllable].copy()
     y = df[TARGET].values
-    chemistry_expansion = chemistry.ENGINE.transform(
-        X_raw, include_original=False, add_interactions=True)
+    chemistry_config = chemistry.ENGINE.auto_configure(
+        X_raw, requested_mode="automatic")
+    chemistry_expansion = chemistry.ENGINE.transform(X_raw, config=chemistry_config)
     chemistry_schema = chemistry_expansion.metadata
     X_raw = chemistry_expansion.frame
     controllable = list(X_raw.columns)

@@ -96,6 +96,105 @@ class ChemistryExpansion:
     original_values: pd.DataFrame
 
 
+@dataclass(frozen=True)
+class ChemicalColumnDetection:
+    column: str
+    confidence: float
+    reason: str
+    recognized_fraction: float
+    unique_values: int
+
+
+@dataclass
+class ChemistryAutoConfig:
+    mode: str = "automatic"
+    detected_columns: list[str] = field(default_factory=list)
+    selected_descriptor_keys: list[str] = field(default_factory=list)
+    selected_categorical_keys: list[str] = field(default_factory=list)
+    selected_interactions: list[str] = field(default_factory=list)
+    retain_original_labels: bool = False
+    collapse_rare_chemicals: bool = True
+    rare_category_min_groups: int = 5
+    drop_constant: bool = True
+    near_constant_threshold: float = 0.99
+    correlation_threshold: float = 0.95
+    max_chemistry_features: int = 40
+    rationale: list[str] = field(default_factory=list)
+
+
+COMPACT_DESCRIPTOR_KEYS = (
+    "Is_Acid", "Is_Base", "Is_Strong_Acid", "Is_Strong_Base",
+    "Is_Oxidizer", "Is_Reducing_Agent", "Is_Transition_Metal_Salt",
+    "Contains_Hydroxide", "Contains_Chloride", "Contains_Sulfate",
+    "Contains_Nitrate", "Contains_Carbonate", "Organic", "Inorganic",
+    "MolecularWeight", "pKa", "pKb", "EstimatedAcidity",
+    "EstimatedBasicity", "EstimatedOxidationTendency",
+    "EstimatedReductionTendency", "EstimatedIonicCharge",
+    "DescriptorConfidence",
+)
+
+STANDARD_EXTRA_DESCRIPTOR_KEYS = (
+    "Num_H", "Num_C", "Num_N", "Num_O", "Num_S", "Num_P",
+    "HalogenCount", "Num_MetalAtoms", "WaterSoluble",
+)
+
+STANDARD_CATEGORICAL_KEYS = (
+    "ChemicalClass", "AnionType", "CationType", "Metal", "Halogen",
+    "IonicStrengthClass", "Corrosiveness",
+)
+
+DESCRIPTOR_FAMILIES: dict[str, tuple[str, ...]] = {
+    "acid_base": (
+        "Is_Acid", "Is_Base", "Is_Strong_Acid", "Is_Weak_Acid",
+        "Is_Strong_Base", "Is_Weak_Base", "pKa", "pKb",
+        "EstimatedAcidity", "EstimatedBasicity",
+    ),
+    "functional_groups": (
+        "Contains_Hydroxide", "Contains_Chloride", "Contains_Sulfate",
+        "Contains_Nitrate", "Contains_Carbonate", "Contains_Phosphate",
+        "Contains_Fluoride", "Is_Carbonate", "Is_Bicarbonate",
+        "Is_Chelating_Agent", "Is_Organic_Solvent",
+    ),
+    "elemental_composition": (
+        "NumAtoms", "Num_H", "Num_C", "Num_N", "Num_O", "Num_S",
+        "Num_P", "Num_F", "Num_Cl", "Num_Br", "Num_I",
+        "Num_MetalAtoms", "HalogenCount", "Organic", "Inorganic",
+    ),
+    "metal_properties": (
+        "Is_Transition_Metal_Salt", "Is_Alkali_Hydroxide",
+        "Is_Alkaline_Earth_Hydroxide", "Is_Metal_Nitrate",
+        "Is_Metal_Chloride", "Is_Metal_Sulfate", "EstimatedIonicCharge",
+    ),
+    "redox": (
+        "Is_Oxidizer", "Is_Reducing_Agent", "EstimatedOxidationTendency",
+        "EstimatedReductionTendency",
+    ),
+    "physical_properties": (
+        "MolecularWeight", "WaterSoluble", "HBD", "HBA", "TPSA", "LogP",
+    ),
+    "categorical_identity": STANDARD_CATEGORICAL_KEYS,
+    "rdkit_topology": (
+        "RotatableBonds", "RingCount", "RDKitMolecularWeight",
+        "HeavyAtomCount", "AromaticRingCount", "FractionCSP3", "BalabanJ",
+    ),
+    "morgan_fingerprint": tuple(f"MorganBit_{i:02d}" for i in range(16)),
+    "interactions": (),
+    "confidence": ("DescriptorConfidence",),
+}
+
+# Earlier entries win when two numerical descriptors are redundant.
+DESCRIPTOR_PREFERENCE = (
+    "Is_Strong_Acid", "Is_Strong_Base", "Is_Acid", "Is_Base",
+    "Is_Oxidizer", "Is_Reducing_Agent", "Is_Transition_Metal_Salt",
+    "Contains_Hydroxide", "Contains_Chloride", "Contains_Sulfate",
+    "Contains_Nitrate", "Contains_Carbonate", "MolecularWeight", "pKa", "pKb",
+    "EstimatedOxidationTendency", "EstimatedReductionTendency",
+    "EstimatedIonicCharge", "DescriptorConfidence", "Organic", "Inorganic",
+    "Num_C", "Num_O", "Num_N", "Num_H", "Num_S", "Num_P", "HalogenCount",
+    "WaterSoluble", "EstimatedAcidity", "EstimatedBasicity",
+)
+
+
 def _norm(text: Any) -> str:
     value = str(text or "").strip().lower()
     value = value.replace("₂", "2").replace("₃", "3").replace("₄", "4")
@@ -562,6 +661,7 @@ class DescriptorGenerator:
             "Contains_Chloride": float("chloride" in tags or atoms.get("Cl", 0) > 0),
             "Contains_Sulfate": float("sulfate" in tags),
             "Contains_Nitrate": float("nitrate" in tags),
+            "Contains_Carbonate": float("carbonate" in tags or "bicarbonate" in tags),
             "Contains_Phosphate": float("phosphate" in tags),
             "Contains_Fluoride": float("fluoride" in tags or atoms.get("F", 0) > 0),
             "pKa": float(record.pka) if record.pka is not None else math.nan,
@@ -673,10 +773,10 @@ class ChemistryFeatureEngineer:
     def __init__(self, generator: DescriptorGenerator | None = None):
         self.generator = generator or DescriptorGenerator()
 
-    def detect_columns(self, frame: pd.DataFrame) -> list[str]:
+    def detect_column_details(self, frame: pd.DataFrame) -> list[ChemicalColumnDetection]:
         blankish = {_norm(t) for t in (*UNKNOWN_TOKENS, "none", "--", "---",
                                        "not applied", "nil", "n.a.")}
-        scored: list[tuple[float, str]] = []
+        detections: list[ChemicalColumnDetection] = []
         for column in frame.columns:
             if pd.api.types.is_numeric_dtype(frame[column]):
                 continue
@@ -686,21 +786,361 @@ class ChemistryFeatureEngineer:
             lname = name.lower()
             # Only real (non-blank) values count toward recognition, so a column
             # full of '--'/'None' is not mistaken for a recognized chemical.
-            sample = [v for v in frame[column].dropna().astype(str).head(120)
+            raw_sample = frame[column].head(120)
+            sample = [v for v in raw_sample.dropna().astype(str)
                       if _norm(v) and _norm(v) not in blankish]
             if not sample:
                 continue
-            recognized = float(np.mean(
-                [self.generator.describe(v).confidence >= 0.7 for v in sample]))
+            descriptions = [self.generator.describe(v) for v in sample]
+            recognized = float(np.mean([d.confidence >= 0.65 for d in descriptions]))
+            formula_fraction = float(np.mean([
+                bool(self.generator.lookup.formula_from_text(v)) for v in sample]))
             always = lname.startswith("solute_label_d")
             hinted = any(hint in lname for hint in self.COLUMN_HINTS)
-            # A name hint only LOWERS the bar; it never forces a column in on its
-            # own (that is what pulled 'Atmosphere' full of Ar/N2 into expansion).
-            threshold = 0.6 if hinted else 0.85
-            if always or recognized >= threshold:
-                scored.append((2.0 if always else recognized, name))
-        scored.sort(key=lambda t: t[0], reverse=True)
-        return [name for _, name in scored[:self.MAX_DETECTED_COLUMNS]]
+            blank_fraction = 1.0 - len(sample) / max(len(raw_sample), 1)
+            unique_values = int(pd.Series(sample).nunique())
+            cardinality_penalty = .12 if unique_values > max(30, len(sample) * .7) else 0.0
+            confidence = (1.0 if always else
+                          .55 * recognized + .25 * float(hinted) +
+                          .15 * formula_fraction + .05 -
+                          .15 * blank_fraction - cardinality_penalty)
+            confidence = float(np.clip(confidence, 0.0, 1.0))
+            reasons = []
+            if always:
+                reasons.append("standardized parsed-solute column")
+            if hinted:
+                reasons.append("chemical column-name hint")
+            reasons.append(f"{recognized:.0%} of sampled values recognized")
+            if formula_fraction:
+                reasons.append(f"{formula_fraction:.0%} formula-like")
+            if blank_fraction > .4:
+                reasons.append(f"{blank_fraction:.0%} blank/missing")
+            detections.append(ChemicalColumnDetection(
+                column=name, confidence=confidence, reason="; ".join(reasons),
+                recognized_fraction=recognized, unique_values=unique_values))
+        return sorted(detections, key=lambda item: item.confidence, reverse=True)
+
+    def detect_columns(self, frame: pd.DataFrame) -> list[str]:
+        return [item.column for item in self.detect_column_details(frame)
+                if item.confidence >= .70][:self.MAX_DETECTED_COLUMNS]
+
+    @staticmethod
+    def _feature_budget(n_groups: int, nonchem_encoded_estimate: int = 0) -> int:
+        if n_groups < 75:
+            base = 15
+        elif n_groups < 150:
+            base = 25
+        elif n_groups < 300:
+            base = 40
+        elif n_groups < 600:
+            base = 60
+        else:
+            base = 100
+        # Aim for at least two independent groups per total encoded predictor,
+        # while reserving room for ordinary process variables.
+        total_budget = max(base, n_groups // 2)
+        available = max(5, total_budget - int(nonchem_encoded_estimate))
+        return int(min(base, available))
+
+    @staticmethod
+    def _group_representative(frame: pd.DataFrame, groups: pd.Series | None) -> pd.DataFrame:
+        data = pd.DataFrame(frame).reset_index(drop=True)
+        if groups is None or len(groups) != len(data):
+            return data
+        marker = pd.Series(groups).reset_index(drop=True).astype(str)
+        keep = ~marker.duplicated()
+        return data.loc[keep].reset_index(drop=True)
+
+    def _candidate_descriptor_frame(self, frame: pd.DataFrame,
+                                    chemical_columns: Sequence[str]):
+        columns: dict[str, list[Any]] = {}
+        feature_to_key: dict[str, str] = {}
+        for column in chemical_columns:
+            prefix = self.prefix(column)
+            descriptors = [self.generator.describe(str(value)) for value in frame[column]]
+            if not descriptors:
+                continue
+            for key in descriptors[0].feature_values():
+                feature = f"{prefix}_{key}"
+                columns[feature] = [d.feature_values().get(key) for d in descriptors]
+                feature_to_key[feature] = key
+        return pd.DataFrame(columns, index=frame.index), feature_to_key
+
+    @staticmethod
+    def _nonchem_encoded_estimate(frame: pd.DataFrame,
+                                  chemical_columns: Sequence[str]) -> int:
+        total = 0
+        for column in frame.columns:
+            if column in chemical_columns:
+                continue
+            if pd.api.types.is_numeric_dtype(frame[column]):
+                total += 1
+            else:
+                total += max(1, min(20, int(frame[column].dropna().astype(str).nunique()) - 1))
+        return total
+
+    def _quality_filter(self, candidates: pd.DataFrame, feature_to_key: Mapping[str, str],
+                        groups: pd.Series | None, near_constant_threshold: float,
+                        correlation_threshold: float):
+        view = self._group_representative(candidates, groups)
+        dropped = {"constant": [], "near_constant": [], "missing": [],
+                   "duplicate": [], "correlated": [], "high_cardinality": []}
+        allowed: list[str] = []
+        signatures: dict[tuple, str] = {}
+        max_categories = max(8, min(25, len(view) // 3 if len(view) else 8))
+        preference = {key: i for i, key in enumerate(DESCRIPTOR_PREFERENCE)}
+        ordered = sorted(candidates.columns,
+                         key=lambda c: (preference.get(feature_to_key[c], 10_000), c))
+        for feature in ordered:
+            series = view[feature]
+            if float(series.isna().mean()) > .60:
+                dropped["missing"].append(feature); continue
+            present = series.dropna()
+            if present.nunique(dropna=True) <= 1:
+                dropped["constant"].append(feature); continue
+            top_fraction = float(present.astype(str).value_counts(normalize=True).iloc[0])
+            if top_fraction > near_constant_threshold:
+                dropped["near_constant"].append(feature); continue
+            if not pd.api.types.is_numeric_dtype(series) and present.astype(str).nunique() > max_categories:
+                dropped["high_cardinality"].append(feature); continue
+            signature = tuple(pd.util.hash_pandas_object(
+                present.reset_index(drop=True).astype(str), index=False).tolist())
+            if signature in signatures:
+                dropped["duplicate"].append(feature); continue
+            signatures[signature] = feature
+            allowed.append(feature)
+
+        numeric_allowed = [c for c in allowed if pd.api.types.is_numeric_dtype(view[c])]
+        kept_numeric: list[str] = []
+        for feature in numeric_allowed:
+            correlated_with = None
+            a = pd.to_numeric(view[feature], errors="coerce")
+            for previous in kept_numeric:
+                b = pd.to_numeric(view[previous], errors="coerce")
+                pair = pd.concat([a, b], axis=1).dropna()
+                if (len(pair) < 3 or pair.iloc[:, 0].nunique() < 2
+                        or pair.iloc[:, 1].nunique() < 2):
+                    continue
+                corr = pair.iloc[:, 0].corr(pair.iloc[:, 1], method="spearman")
+                if pd.notna(corr) and abs(float(corr)) >= correlation_threshold:
+                    correlated_with = previous
+                    break
+            if correlated_with:
+                dropped["correlated"].append(feature)
+            else:
+                kept_numeric.append(feature)
+        allowed = [c for c in allowed if c not in set(dropped["correlated"])]
+        return allowed, dropped
+
+    def _interaction_candidates(self, frame: pd.DataFrame,
+                                chemical_columns: Sequence[str]):
+        required = {"Is_Strong_Acid", "Is_Strong_Base", "Is_Oxidizer",
+                    "Contains_Hydroxide", "Is_Acid", "Is_Transition_Metal_Salt"}
+        descriptor_columns: dict[str, list[Any]] = {}
+        metadata = {"columns": {}, "interactions": [], "interaction_specs": []}
+        for column in chemical_columns:
+            prefix = self.prefix(column)
+            descriptors = [self.generator.describe(str(value)) for value in frame[column]]
+            names = []
+            for key in required:
+                feature = f"{prefix}_{key}"
+                descriptor_columns[feature] = [d.feature_values().get(key, 0.0)
+                                               for d in descriptors]
+                names.append(feature)
+            metadata["columns"][column] = {"prefix": prefix, "descriptor_columns": names}
+        result = pd.concat([frame, pd.DataFrame(descriptor_columns, index=frame.index)], axis=1)
+        result = self._add_interactions(result, frame, chemical_columns, metadata)
+        return result, metadata
+
+    def _supported_interactions(self, frame: pd.DataFrame,
+                                chemical_columns: Sequence[str], groups: pd.Series | None,
+                                selected_keys: set[str], mode: str):
+        candidate_frame, metadata = self._interaction_candidates(frame, chemical_columns)
+        selected, omitted = [], []
+        view = self._group_representative(candidate_frame, groups)
+        limit = 3 if len(view) < 150 else 6 if len(view) < 300 else 12
+        for spec in metadata["interaction_specs"]:
+            left_key = spec["left"].split(metadata["columns"][next(
+                c for c, info in metadata["columns"].items()
+                if spec["left"].startswith(info["prefix"] + "_"))]["prefix"] + "_", 1)[-1]
+            if mode != "full" and left_key not in selected_keys:
+                omitted.append((spec["feature"], "required descriptor was not selected")); continue
+            values = pd.to_numeric(view[spec["feature"]], errors="coerce")
+            left = pd.to_numeric(view[spec["left"]], errors="coerce")
+            right = pd.to_numeric(view[spec["right"]], errors="coerce")
+            nonzero_groups = int(((values.notna()) & (values.abs() > 1e-12)).sum())
+            supported = (left.nunique(dropna=True) >= 2 and right.nunique(dropna=True) >= 2
+                         and values.nunique(dropna=True) >= 2 and nonzero_groups >= 10)
+            if mode == "full" or supported:
+                if len(selected) < limit or mode == "full":
+                    selected.append(spec["feature"])
+                else:
+                    omitted.append((spec["feature"], f"group-count limit of {limit}"))
+            else:
+                omitted.append((spec["feature"],
+                                f"only {nonzero_groups} independent groups had nonzero support"))
+        return selected, omitted
+
+    def auto_configure(self, frame: pd.DataFrame, chemical_columns: Sequence[str] | None = None,
+                       groups: pd.Series | None = None, target: pd.Series | None = None,
+                       requested_mode: str = "automatic") -> ChemistryAutoConfig:
+        del target  # Deliberately unused: global target-informed selection would leak.
+        source = pd.DataFrame(frame).copy()
+        detections = self.detect_column_details(source)
+        columns = list(chemical_columns or [d.column for d in detections
+                                            if d.confidence >= .70][:self.MAX_DETECTED_COLUMNS])
+        columns = [c for c in columns if c in source]
+        mode = str(requested_mode or "automatic").lower().split(" ", 1)[0]
+        if mode not in {"off", "automatic", "compact", "standard", "full", "custom"}:
+            mode = "automatic"
+        n_rows = len(source)
+        n_groups = int(pd.Series(groups).nunique()) if groups is not None else n_rows
+        budget = self._feature_budget(
+            n_groups, self._nonchem_encoded_estimate(source, columns))
+        rationale = [f"Configuration used {n_groups} independent groups ({n_rows} rows)."]
+        if mode == "off" or not columns:
+            rationale.append("Chemistry expansion is off." if mode == "off"
+                             else "No chemical columns met the 0.70 detection threshold.")
+            config = ChemistryAutoConfig(mode=mode, detected_columns=columns,
+                                         retain_original_labels=True,
+                                         max_chemistry_features=0, rationale=rationale)
+            config._detections = detections
+            config._diagnostics = {"candidate_count": 0, "selected_count": 0,
+                                   "dropped_count": 0}
+            return config
+
+        candidates, feature_to_key = self._candidate_descriptor_frame(source, columns)
+        allowed, dropped = self._quality_filter(
+            candidates, feature_to_key, groups, .99, .95)
+        all_numeric_keys = list(dict.fromkeys(
+            key for feature, key in feature_to_key.items()
+            if pd.api.types.is_numeric_dtype(candidates[feature])))
+        all_categorical_keys = list(dict.fromkeys(
+            key for feature, key in feature_to_key.items()
+            if not pd.api.types.is_numeric_dtype(candidates[feature])))
+        allowed_by_key = {key: [f for f in allowed if feature_to_key[f] == key]
+                          for key in set(feature_to_key.values())}
+
+        if mode == "full":
+            selected_numeric, selected_categorical = all_numeric_keys, all_categorical_keys
+            selected_feature_set = set(candidates.columns)
+            drop_constant = False
+            rationale.append("Full mode retained the legacy descriptor set.")
+        else:
+            if mode == "compact":
+                requested = list(COMPACT_DESCRIPTOR_KEYS)
+                categorical_requested: list[str] = []
+            elif mode == "standard":
+                requested = list(dict.fromkeys(
+                    (*COMPACT_DESCRIPTOR_KEYS, *STANDARD_EXTRA_DESCRIPTOR_KEYS)))
+                categorical_requested = list(STANDARD_CATEGORICAL_KEYS)
+            elif mode == "custom":
+                requested = list(COMPACT_DESCRIPTOR_KEYS)
+                categorical_requested = []
+            else:
+                excluded_small = set(DESCRIPTOR_FAMILIES["morgan_fingerprint"])
+                if n_groups < 300:
+                    excluded_small.update(DESCRIPTOR_FAMILIES["rdkit_topology"])
+                    excluded_small.update(("Num_F", "Num_Cl", "Num_Br", "Num_I"))
+                    rationale.append(
+                        "Morgan fingerprints and broad RDKit topology were disabled because "
+                        "fewer than 300 independent groups are available.")
+                requested = [key for key in dict.fromkeys(
+                    (*DESCRIPTOR_PREFERENCE, *COMPACT_DESCRIPTOR_KEYS,
+                     *STANDARD_EXTRA_DESCRIPTOR_KEYS, *all_numeric_keys))
+                             if key not in excluded_small]
+                categorical_requested = (list(STANDARD_CATEGORICAL_KEYS)
+                                         if n_groups >= 300 else [])
+
+            selected_numeric, selected_categorical = [], []
+            selected_feature_set: set[str] = set()
+            reserve = 3 if n_groups < 150 else 6 if n_groups < 300 else 10
+            descriptor_budget = budget if mode in {"compact", "standard", "custom"} \
+                else max(1, budget - reserve)
+            for key in requested:
+                additions = [f for f in allowed_by_key.get(key, [])
+                             if f not in selected_feature_set]
+                if not additions:
+                    continue
+                if mode == "automatic" and len(selected_feature_set) + len(additions) > descriptor_budget:
+                    continue
+                selected_numeric.append(key)
+                selected_feature_set.update(additions)
+            for key in categorical_requested:
+                additions = [f for f in allowed_by_key.get(key, [])
+                             if f not in selected_feature_set]
+                if additions and (mode != "automatic" or
+                                  len(selected_feature_set) + len(additions) <= descriptor_budget):
+                    selected_categorical.append(key)
+                    selected_feature_set.update(additions)
+            drop_constant = True
+
+        selected_interactions, omitted_interactions = self._supported_interactions(
+            source, columns, groups, set(selected_numeric), mode)
+        if mode == "automatic":
+            available_for_interactions = max(0, budget - len(selected_feature_set))
+            if len(selected_interactions) > available_for_interactions:
+                omitted_interactions.extend(
+                    (name, "automatic chemistry feature budget")
+                    for name in selected_interactions[available_for_interactions:])
+            selected_interactions = selected_interactions[:available_for_interactions]
+
+        semantic = {_norm(v) for v in (*UNKNOWN_TOKENS, *NONE_TOKENS)}
+        rare_by_column: dict[str, list[str]] = {}
+        total_common = 0
+        group_values = (pd.Series(groups).reset_index(drop=True).astype(str)
+                        if groups is not None and len(groups) == len(source)
+                        else pd.Series(np.arange(len(source))).astype(str))
+        for column in columns:
+            counts = (pd.DataFrame({"chemical": source[column].astype(str).reset_index(drop=True),
+                                    "group": group_values})
+                      .drop_duplicates().groupby("chemical")["group"].nunique())
+            rare = [str(name) for name, count in counts.items()
+                    if count < 5 and _norm(name) not in semantic]
+            rare_by_column[column] = rare
+            total_common += int(sum(count >= 5 and _norm(name) not in semantic
+                                    for name, count in counts.items()))
+        retain_labels = bool(total_common and n_groups >= 10 * total_common)
+        if mode in {"automatic", "compact"} and not retain_labels:
+            rationale.append("Rare chemical identities were replaced by transferable descriptors.")
+        if mode == "full":
+            retain_labels = False  # Preserve the previous Full transform behavior.
+        if mode == "automatic":
+            rationale.insert(0,
+                f"Compact chemistry representation selected because only {n_groups} "
+                "independent synthesis conditions are available.")
+        rationale.append(
+            f"{len(selected_interactions)} chemically meaningful interaction(s) passed "
+            "variation and independent-group support checks.")
+        if omitted_interactions:
+            rationale.append(f"{len(omitted_interactions)} interaction candidate(s) were omitted.")
+
+        config = ChemistryAutoConfig(
+            mode=mode, detected_columns=columns,
+            selected_descriptor_keys=list(dict.fromkeys(selected_numeric)),
+            selected_categorical_keys=list(dict.fromkeys(selected_categorical)),
+            selected_interactions=selected_interactions,
+            retain_original_labels=retain_labels, collapse_rare_chemicals=retain_labels,
+            rare_category_min_groups=5, drop_constant=drop_constant,
+            near_constant_threshold=.99, correlation_threshold=.95,
+            max_chemistry_features=budget, rationale=rationale)
+        config._allowed_descriptor_features = selected_feature_set
+        config._rare_categories_by_column = rare_by_column
+        config._detections = detections
+        config._diagnostics = {
+            "candidate_count": int(candidates.shape[1]),
+            "selected_count": int(len(selected_feature_set) + len(selected_interactions)),
+            "dropped_count": int(candidates.shape[1] - len(selected_feature_set)),
+            "dropped_constant": dropped["constant"],
+            "dropped_near_constant": dropped["near_constant"],
+            "dropped_missing": dropped["missing"],
+            "dropped_duplicate": dropped["duplicate"],
+            "dropped_correlated": dropped["correlated"],
+            "dropped_high_cardinality": dropped["high_cardinality"],
+            "omitted_interactions": omitted_interactions,
+            "n_rows": n_rows, "n_groups": n_groups,
+        }
+        return config
 
     @staticmethod
     def prefix(column: str) -> str:
@@ -708,15 +1148,68 @@ class ChemistryFeatureEngineer:
         return re.sub(r"[^A-Za-z0-9_]+", "_", name) or "Chemical"
 
     def transform(self, frame: pd.DataFrame, chemical_columns: Sequence[str] | None = None,
-                  include_original: bool = False, add_interactions: bool = True) -> ChemistryExpansion:
+                  include_original: bool | None = None,
+                  add_interactions: bool | None = None,
+                  config: ChemistryAutoConfig | Mapping | None = None) -> ChemistryExpansion:
         source = pd.DataFrame(frame).copy()
-        chemical_columns = list(chemical_columns or self.detect_columns(source))
+        legacy_full = config is None
+        if isinstance(config, Mapping):
+            fields = ChemistryAutoConfig.__dataclass_fields__
+            config = ChemistryAutoConfig(**{k: v for k, v in dict(config).items() if k in fields})
+        if config is None:
+            detected = list(chemical_columns or self.detect_columns(source))
+            example = self.generator.describe("HCl")
+            config = ChemistryAutoConfig(
+                mode="full", detected_columns=detected,
+                selected_descriptor_keys=list(example.numeric) + ["DescriptorConfidence"],
+                selected_categorical_keys=list(example.categorical),
+                retain_original_labels=False, drop_constant=False,
+                max_chemistry_features=10_000,
+                rationale=["Legacy Full transform requested."],
+            )
+        chemical_columns = list(chemical_columns or config.detected_columns)
         chemical_columns = [c for c in chemical_columns if c in source.columns]
         originals = source[chemical_columns].copy() if chemical_columns else pd.DataFrame(index=source.index)
+        if config.mode == "off" or not chemical_columns:
+            metadata = {
+                "mode": config.mode, "columns": {}, "detected_columns": chemical_columns,
+                "rdkit_available": self.generator.rdkit.available,
+                "interactions": [], "interaction_specs": [],
+                "candidate_descriptor_count": 0, "selected_descriptor_count": 0,
+                "descriptor_feature_count": 0, "feature_budget": config.max_chemistry_features,
+                "rationale": list(config.rationale), "retain_original_labels": True,
+                "chemistry_config": asdict(config),
+            }
+            return ChemistryExpansion(source.copy(), metadata, originals)
+
+        include_original = (config.retain_original_labels if include_original is None
+                            else bool(include_original))
+        add_interactions = ((True if legacy_full else bool(config.selected_interactions))
+                            if add_interactions is None else bool(add_interactions))
+        selected_keys = list(dict.fromkeys(
+            (*config.selected_descriptor_keys, *config.selected_categorical_keys)))
+        allowed_features = getattr(config, "_allowed_descriptor_features", None)
+        rare_by_column = getattr(config, "_rare_categories_by_column", {})
+        diagnostics = dict(getattr(config, "_diagnostics", {}))
         metadata: dict[str, Any] = {
+            "mode": config.mode, "detected_columns": chemical_columns,
             "columns": {}, "rdkit_available": self.generator.rdkit.available,
             "interactions": [], "interaction_specs": [],
+            "selected_interactions": list(config.selected_interactions),
             "descriptor_feature_count": 0,
+            "candidate_descriptor_count": diagnostics.get(
+                "candidate_count", len(selected_keys) * len(chemical_columns)),
+            "selected_descriptor_count": 0,
+            "dropped_constant": diagnostics.get("dropped_constant", []),
+            "dropped_near_constant": diagnostics.get("dropped_near_constant", []),
+            "dropped_correlated": diagnostics.get("dropped_correlated", []),
+            "dropped_missing": diagnostics.get("dropped_missing", []),
+            "dropped_duplicate": diagnostics.get("dropped_duplicate", []),
+            "omitted_interactions": diagnostics.get("omitted_interactions", []),
+            "feature_budget": config.max_chemistry_features,
+            "rationale": list(config.rationale),
+            "retain_original_labels": include_original,
+            "chemistry_config": asdict(config),
         }
         # Accumulate every descriptor column and add them all at once — assigning
         # them one by one fragments the DataFrame (pandas PerformanceWarning).
@@ -726,20 +1219,43 @@ class ChemistryFeatureEngineer:
             prefix = self.prefix(column)
             descriptors = [self.generator.describe(str(value)) for value in source[column]]
             feature_names: list[str] = []
+            descriptor_keys: list[str] = []
             if descriptors:
-                keys = list(descriptors[0].feature_values())
-                for key in keys:
+                values0 = descriptors[0].feature_values()
+                for key in selected_keys:
+                    if key not in values0:
+                        continue
                     feature = f"{prefix}_{key}"
-                    descriptor_columns[feature] = [d.feature_values().get(key) for d in descriptors]
+                    if allowed_features is not None and feature not in allowed_features:
+                        continue
+                    values = pd.Series([d.feature_values().get(key) for d in descriptors],
+                                       index=source.index)
+                    if config.drop_constant and allowed_features is None:
+                        present = values.dropna()
+                        if present.nunique(dropna=True) <= 1:
+                            metadata["dropped_constant"].append(feature); continue
+                        if (not present.empty and
+                                present.astype(str).value_counts(normalize=True).iloc[0]
+                                > config.near_constant_threshold):
+                            metadata["dropped_near_constant"].append(feature); continue
+                        if float(values.isna().mean()) > .60:
+                            metadata["dropped_missing"].append(feature); continue
+                    descriptor_columns[feature] = values.tolist()
                     feature_names.append(feature)
+                    descriptor_keys.append(key)
             metadata["columns"][column] = {
                 "prefix": prefix,
                 "descriptor_columns": feature_names,
+                "descriptor_keys": descriptor_keys,
                 "observed_chemicals": sorted(set(map(str, source[column].dropna().unique()))),
                 "mean_confidence": float(np.mean([d.confidence for d in descriptors])) if descriptors else 0.0,
+                "rare_categories": list(rare_by_column.get(column, [])),
             }
             if not include_original:
                 drop_columns.append(column)
+            elif config.collapse_rare_chemicals and rare_by_column.get(column):
+                source[column] = source[column].where(
+                    ~source[column].astype(str).isin(rare_by_column[column]), "Other")
             metadata["descriptor_feature_count"] += len(feature_names)
 
         base = source.drop(columns=drop_columns) if drop_columns else source
@@ -755,11 +1271,27 @@ class ChemistryFeatureEngineer:
             result = base.copy()
 
         if add_interactions and chemical_columns:
-            result = self._add_interactions(result, source, chemical_columns, metadata)
+            allowed_interactions = (None if legacy_full else set(config.selected_interactions))
+            result = self._add_interactions(
+                result, source, chemical_columns, metadata,
+                allowed_interactions=allowed_interactions)
+        metadata["selected_descriptor_count"] = metadata["descriptor_feature_count"]
+        metadata["selected_interactions"] = list(metadata["interactions"])
+        metadata["chemistry_feature_diagnostics"] = {
+            "candidate_count": metadata["candidate_descriptor_count"],
+            "selected_count": metadata["descriptor_feature_count"] + len(metadata["interactions"]),
+            "dropped_count": max(0, metadata["candidate_descriptor_count"] -
+                                 metadata["descriptor_feature_count"]),
+            "groups_per_chemistry_feature": (
+                diagnostics.get("n_groups", len(source)) /
+                max(1, metadata["descriptor_feature_count"] + len(metadata["interactions"]))),
+            "rationale": list(config.rationale),
+        }
         return ChemistryExpansion(result, metadata, originals)
 
     def _add_interactions(self, result: pd.DataFrame, source: pd.DataFrame,
-                          chemical_columns: Sequence[str], metadata: dict[str, Any]) -> pd.DataFrame:
+                          chemical_columns: Sequence[str], metadata: dict[str, Any],
+                          allowed_interactions: set[str] | None = None) -> pd.DataFrame:
         numeric = [c for c in source.columns if pd.api.types.is_numeric_dtype(source[c])]
         temperatures = [c for c in numeric if re.search(r"temp|pyro", str(c), re.I)]
         times = [c for c in numeric if re.search(r"holding|hold.*time|time", str(c), re.I)]
@@ -784,6 +1316,8 @@ class ChemistryFeatureEngineer:
             def interaction(flag: str, companion: str | None, label: str):
                 feature = f"{prefix}_{label}"
                 flag_column = f"{prefix}_{flag}"
+                if allowed_interactions is not None and feature not in allowed_interactions:
+                    return
                 if companion and flag_column in result and companion in source:
                     values = pd.to_numeric(source[companion], errors="coerce")
                     additions[feature] = pd.to_numeric(result[flag_column], errors="coerce") * values
@@ -808,14 +1342,96 @@ class ChemistryFeatureEngineer:
             return pd.concat([result, pd.DataFrame(additions, index=result.index)], axis=1)
         return result
 
+    def transform_with_schema(self, frame: pd.DataFrame,
+                              chemistry_schema: Mapping[str, Any]) -> pd.DataFrame:
+        """Apply exactly a trained chemistry schema; never auto-configure here."""
+        schema = dict(chemistry_schema or {})
+        source = pd.DataFrame(frame).copy()
+        descriptor_columns: dict[str, list[Any]] = {}
+        drop_columns: list[str] = []
+        retain = bool(schema.get("retain_original_labels", False))
+        for column, info in schema.get("columns", {}).items():
+            if column not in source:
+                source[column] = "Unknown"
+            prefix = info.get("prefix", self.prefix(column))
+            keys = list(info.get("descriptor_keys", []))
+            if not keys:
+                marker = prefix + "_"
+                keys = [name[len(marker):] for name in info.get("descriptor_columns", [])
+                        if str(name).startswith(marker)]
+            descriptors = [self.generator.describe(str(value)) for value in source[column]]
+            expected = set(info.get("descriptor_columns", []))
+            for key in keys:
+                feature = f"{prefix}_{key}"
+                if expected and feature not in expected:
+                    continue
+                descriptor_columns[feature] = [d.feature_values().get(key) for d in descriptors]
+            if retain:
+                rare = set(map(str, info.get("rare_categories", [])))
+                if rare:
+                    source[column] = source[column].where(
+                        ~source[column].astype(str).isin(rare), "Other")
+            else:
+                drop_columns.append(column)
+        base = source.drop(columns=drop_columns, errors="ignore")
+        overlap = [c for c in base if c in descriptor_columns]
+        if overlap:
+            base = base.drop(columns=overlap)
+        result = (pd.concat([base, pd.DataFrame(descriptor_columns, index=source.index)], axis=1)
+                  if descriptor_columns else base.copy())
+        additions = {}
+        for spec in schema.get("interaction_specs", []):
+            left = spec.get("left")
+            right = spec.get("right")
+            if left in result and right in source:
+                additions[spec["feature"]] = (
+                    pd.to_numeric(result[left], errors="coerce") *
+                    pd.to_numeric(source[right], errors="coerce"))
+        if additions:
+            result = result.drop(columns=[c for c in additions if c in result], errors="ignore")
+            result = pd.concat([result, pd.DataFrame(additions, index=result.index)], axis=1)
+        return result
+
     def expand_row(self, raw: Mapping[str, Any], chemistry_schema: Mapping[str, Any]) -> dict[str, Any]:
-        frame = pd.DataFrame([dict(raw)])
-        columns = list((chemistry_schema or {}).get("columns", {}))
-        for column in columns:
-            if column not in frame:
-                frame[column] = "Unknown"
-        expanded = self.transform(frame, columns, include_original=False, add_interactions=True).frame
+        expanded = self.transform_with_schema(pd.DataFrame([dict(raw)]), chemistry_schema)
         return expanded.iloc[0].to_dict()
+
+    def estimate_feature_counts(self, frame: pd.DataFrame, config: ChemistryAutoConfig,
+                                groups: pd.Series | None = None) -> dict[str, Any]:
+        source = pd.DataFrame(frame)
+        expansion = self.transform(source, config=config)
+        chemistry_features = {
+            c for info in expansion.metadata.get("columns", {}).values()
+            for c in info.get("descriptor_columns", [])}
+        chemistry_features.update(expansion.metadata.get("interactions", []))
+        numerical_chemistry = sum(
+            c in expansion.frame and pd.api.types.is_numeric_dtype(expansion.frame[c])
+            for c in chemistry_features)
+        categorical_dummy = 0
+        total_encoded = 0
+        for column in expansion.frame:
+            if pd.api.types.is_numeric_dtype(expansion.frame[column]):
+                total_encoded += 1
+            else:
+                levels = int(expansion.frame[column].dropna().astype(str).nunique())
+                dummies = max(1, levels - 1)
+                total_encoded += dummies
+                if column in chemistry_features:
+                    categorical_dummy += dummies
+        n_groups = int(pd.Series(groups).nunique()) if groups is not None else len(source)
+        ratio = n_groups / max(total_encoded, 1)
+        risk = "Good" if ratio >= 5 else "Caution" if ratio >= 1 else "High risk"
+        return {
+            "original_predictors": int(source.shape[1]),
+            "estimated_numeric_descriptors": int(numerical_chemistry),
+            "estimated_categorical_dummy_columns": int(categorical_dummy),
+            "estimated_total_encoded_predictors": int(total_encoded),
+            "independent_groups": n_groups,
+            "groups_per_encoded_predictor": float(ratio),
+            "risk": risk,
+            "chemistry_features": int(len(chemistry_features)),
+            "expansion": expansion,
+        }
 
     def knowledge_for_values(self, values: Iterable[Any]) -> list[dict[str, Any]]:
         rows = []
@@ -899,3 +1515,45 @@ def descriptor_is_discrete(feature: str) -> bool:
 
 # Shared process-local engine. Descriptor generation and RDKit calls are cached.
 ENGINE = ChemistryFeatureEngineer()
+
+
+def auto_configure_chemistry(
+    frame: pd.DataFrame,
+    chemical_columns: Sequence[str],
+    groups: pd.Series | None = None,
+    target: pd.Series | None = None,
+    requested_mode: str = "automatic",
+) -> ChemistryAutoConfig:
+    """Public group-aware configurator using the shared cached engine."""
+    return ENGINE.auto_configure(
+        frame, chemical_columns=chemical_columns, groups=groups, target=target,
+        requested_mode=requested_mode)
+
+
+def chemistry_config_as_dict(config: ChemistryAutoConfig | Mapping | None) -> dict[str, Any]:
+    if config is None:
+        return {}
+    if isinstance(config, ChemistryAutoConfig):
+        return asdict(config)
+    return dict(config)
+
+
+def apply_custom_families(config: ChemistryAutoConfig,
+                          enabled_families: Iterable[str]) -> ChemistryAutoConfig:
+    """Replace a Custom configuration's descriptor keys with named families."""
+    families = [name for name in enabled_families if name in DESCRIPTOR_FAMILIES]
+    keys = list(dict.fromkeys(
+        key for family in families if family not in {"categorical_identity", "interactions"}
+        for key in DESCRIPTOR_FAMILIES[family]))
+    categoricals = (list(STANDARD_CATEGORICAL_KEYS)
+                    if "categorical_identity" in families else [])
+    config.mode = "custom"
+    config.selected_descriptor_keys = keys
+    config.selected_categorical_keys = categoricals
+    if "interactions" not in families:
+        config.selected_interactions = []
+    config.rationale.append("Custom descriptor families: " +
+                            (", ".join(families) if families else "none"))
+    if hasattr(config, "_allowed_descriptor_features"):
+        delattr(config, "_allowed_descriptor_features")
+    return config

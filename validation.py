@@ -429,6 +429,28 @@ def load_settings_compat(spec: Mapping | None) -> dict:
     reporting.setdefault("top_feature_count", 20)
     reporting.setdefault("show_feature_ratio_warnings", True)
     result["reporting"] = reporting
+    legacy_chemistry = dict(result.get("chemistry") or {})
+    chemistry_features = dict(result.get("chemistry_features") or {})
+    requested_chemistry_mode = str(
+        chemistry_features.get("mode", "automatic")).lower()
+    legacy_enabled = result.get(
+        "chemistry_enabled", legacy_chemistry.get(
+            "enabled", requested_chemistry_mode != "off"))
+    chemistry_features.setdefault("enabled", bool(legacy_enabled))
+    chemistry_features.setdefault(
+        "mode", "automatic" if chemistry_features["enabled"] else "off")
+    chemistry_features.setdefault("auto_configure", True)
+    chemistry_features.setdefault("max_chemistry_features", None)
+    chemistry_features.setdefault("retain_original_labels", "auto")
+    chemistry_features.setdefault("rare_category_min_groups", 5)
+    chemistry_features.setdefault("near_constant_threshold", 0.99)
+    chemistry_features.setdefault("correlation_threshold", 0.95)
+    chemistry_features.setdefault("enable_interactions", "auto")
+    chemistry_features.setdefault("enable_rdkit_descriptors", "auto")
+    chemistry_features.setdefault("enable_morgan_fingerprints", False)
+    result["chemistry_features"] = chemistry_features
+    # Keep the original section for descriptor overrides/PubChem compatibility.
+    result["chemistry"] = legacy_chemistry
     return result
 
 
@@ -448,4 +470,7 @@ def load_model_bundle_compat(loaded) -> dict:
     bundle.setdefault("metric_distributions", {})
     bundle.setdefault("feature_diagnostics", {})
     bundle.setdefault("oof_prediction_samples", None)
+    bundle.setdefault("chemistry_config", {})
+    bundle.setdefault("chemistry_schema", {})
+    bundle.setdefault("chemistry_feature_diagnostics", {})
     return bundle

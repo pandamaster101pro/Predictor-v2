@@ -161,8 +161,15 @@ def test_old_settings_and_saved_models_load():
     assert settings["validation"]["method"] == "random_kfold"
     assert settings["training"]["target"] == "old_target"
     assert settings["reporting"]["top_feature_count"] == 20
+    assert settings["chemistry_features"]["mode"] == "automatic"
+    disabled = V.load_settings_compat({"chemistry_enabled": False})
+    assert disabled["chemistry_features"]["enabled"] is False
+    assert disabled["chemistry_features"]["mode"] == "off"
     estimator = Ridge()
     bundle = V.load_model_bundle_compat(estimator)
     assert bundle["model"] is estimator
     assert bundle["validation_config"]["n_splits"] == 5
     assert bundle["metric_distributions"] == {}
+    assert bundle["chemistry_config"] == {}
+    assert bundle["chemistry_schema"] == {}
+    assert bundle["chemistry_feature_diagnostics"] == {}

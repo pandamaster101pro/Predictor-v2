@@ -2,6 +2,7 @@
 
 import math
 
+import numpy as np
 import pandas as pd
 import pytest
 from sklearn.linear_model import Ridge
@@ -194,5 +195,151 @@ def test_application_training_builder_uses_descriptors_and_keeps_originals(tmp_p
     assert "Pretreat1_Is_Strong_Acid" in data["X_raw"]
     assert not any("Chemical_HCl" in column for column in data["X_encoded"])
     assert data["chemistry_originals"]["Pretreat1_Chemical"].iloc[0] == "HCl"
-    assert data["chemistry_schema"]["descriptor_feature_count"] > 20
+    assert 0 < data["chemistry_schema"]["descriptor_feature_count"] <= 15
+    assert data["chemistry_config"]["mode"] == "automatic"
+
+
+def automatic_frame(n_groups=175, n_chemical_columns=5):
+    chemicals = ["HCl", "H2SO4", "NaOH", "KOH", "ZnCl2", "Na2CO3", "None", "Unknown"]
+    data = {}
+    for index in range(n_chemical_columns):
+        data[f"Pretreat{index + 1}_Chemical"] = [
+            chemicals[(row + index) % len(chemicals)] for row in range(n_groups)]
+        data[f"Pretreat{index + 1}_Molarity"] = np.tile(
+            [0.5, 1.0, 1.5, 2.0, 3.0], int(np.ceil(n_groups / 5)))[:n_groups]
+    data["PyrolysisTemperature"] = 600 + np.arange(n_groups) % 300
+    data["HoldingTime"] = 1 + np.arange(n_groups) % 12
+    data["BiomassFraction"] = np.arange(n_groups) % 7
+    return pd.DataFrame(data), pd.Series([f"g{row}" for row in range(n_groups)])
+
+
+def test_automatic_budget_scales_with_independent_groups():
+    engine = chemistry.ChemistryFeatureEngineer()
+    small, small_groups = automatic_frame(75, 2)
+    large, large_groups = automatic_frame(500, 2)
+    small_config = engine.auto_configure(small, groups=small_groups)
+    large_config = engine.auto_configure(large, groups=large_groups)
+    small_count = engine.transform(small, config=small_config).metadata[
+        "chemistry_feature_diagnostics"]["selected_count"]
+    large_count = engine.transform(large, config=large_config).metadata[
+        "chemistry_feature_diagnostics"]["selected_count"]
+    assert small_config.max_chemistry_features == 25
+    assert large_config.max_chemistry_features == 60
+    assert small_count < large_count
+
+
+def test_automatic_175_group_case_stays_within_40_chemistry_features():
+    frame, groups = automatic_frame(175, 5)
+    engine = chemistry.ChemistryFeatureEngineer()
+    config = engine.auto_configure(frame, groups=groups)
+    expansion = engine.transform(frame, config=config)
+    selected = expansion.metadata["chemistry_feature_diagnostics"]["selected_count"]
+    assert config.mode == "automatic"
+    assert 25 <= selected <= 40
+    assert not any(key.startswith("MorganBit") for key in config.selected_descriptor_keys)
+    assert not set(chemistry.DESCRIPTOR_FAMILIES["rdkit_topology"]) & set(
+        config.selected_descriptor_keys)
+
+
+def test_constant_near_constant_and_correlated_descriptors_are_removed():
+    engine = chemistry.ChemistryFeatureEngineer()
+    constant = pd.DataFrame({"Reagent_Chemical": ["HCl"] * 30})
+    constant_cfg = engine.auto_configure(
+        constant, groups=pd.Series(range(30)))
+    assert constant_cfg._diagnostics["dropped_constant"]
+
+    near = pd.DataFrame({"Reagent_Chemical": ["HCl"] * 100 + ["NaOH"]})
+    near_cfg = engine.auto_configure(near, groups=pd.Series(range(101)))
+    assert any("Is_Acid" in name or "Is_Strong_Acid" in name
+               for name in near_cfg._diagnostics["dropped_near_constant"])
+
+    balanced = pd.DataFrame({"Reagent_Chemical": ["HCl", "NaOH"] * 30})
+    balanced_cfg = engine.auto_configure(balanced, groups=pd.Series(range(60)))
+    assert balanced_cfg._diagnostics["dropped_correlated"]
+    expansion = engine.transform(balanced, config=balanced_cfg)
+    assert not ({"Reagent_Is_Acid", "Reagent_Is_Strong_Acid"}
+                <= set(expansion.frame.columns))
+
+
+def test_rare_original_labels_are_collapsed_by_independent_group_count():
+    values = ["HCl"] * 50 + ["NaOH"] * 50 + ["ZnCl2"] * 2
+    frame = pd.DataFrame({"Reagent_Chemical": values})
+    groups = pd.Series([f"g{i}" for i in range(len(frame))])
+    engine = chemistry.ChemistryFeatureEngineer()
+    config = engine.auto_configure(frame, groups=groups, requested_mode="compact")
+    assert config.retain_original_labels is True
+    expansion = engine.transform(frame, config=config)
+    assert expansion.frame["Reagent_Chemical"].iloc[-1] == "Other"
+    assert "None" not in config._rare_categories_by_column["Reagent_Chemical"]
+
+
+def test_compact_removes_original_labels_without_enough_group_support():
+    frame = pd.DataFrame({
+        "Reagent_Chemical": ["HCl", "NaOH", "KOH", "ZnCl2"] * 5})
+    engine = chemistry.ChemistryFeatureEngineer()
+    config = engine.auto_configure(
+        frame, groups=pd.Series(range(len(frame))), requested_mode="compact")
+    expansion = engine.transform(frame, config=config)
+    assert config.retain_original_labels is False
+    assert "Reagent_Chemical" not in expansion.frame
+
+
+def test_full_mode_preserves_legacy_full_transform_columns():
+    frame, groups = automatic_frame(40, 1)
+    engine = chemistry.ChemistryFeatureEngineer()
+    legacy = engine.transform(frame)
+    full_config = engine.auto_configure(
+        frame, groups=groups, requested_mode="full")
+    full = engine.transform(frame, config=full_config)
+    assert set(full.frame.columns) == set(legacy.frame.columns)
+    assert full.metadata["descriptor_feature_count"] == legacy.metadata[
+        "descriptor_feature_count"]
+
+
+def test_detection_confidence_skips_atmosphere_and_uncertain_text():
+    frame = pd.DataFrame({
+        "Atmosphere": ["N2", "Ar", "CO2", "Air"] * 5,
+        "Treatment": ["HBr", "Ca(OH)2", "CuSO4", "AlCl3"] * 5,
+        "route": ["A", "B", "C", "D"] * 5,
+    })
+    engine = chemistry.ChemistryFeatureEngineer()
+    details = {item.column: item for item in engine.detect_column_details(frame)}
+    detected = engine.detect_columns(frame)
+    assert "Atmosphere" not in details and "Atmosphere" not in detected
+    assert details["Treatment"].confidence >= .70
+    assert "Treatment" in detected
+    assert details["route"].confidence < .70
+    assert "route" not in detected
+
+
+def test_prediction_expansion_uses_only_saved_schema():
+    frame, groups = automatic_frame(100, 2)
+    engine = chemistry.ChemistryFeatureEngineer()
+    config = engine.auto_configure(frame, groups=groups)
+    trained = engine.transform(frame, config=config)
+    candidate = frame.iloc[[0]].copy()
+    predicted = engine.transform_with_schema(candidate, trained.metadata)
+    expected_chemistry = {
+        column for info in trained.metadata["columns"].values()
+        for column in info["descriptor_columns"]}
+    expected_chemistry.update(trained.metadata["interactions"])
+    assert expected_chemistry <= set(predicted.columns)
+    assert not any("MorganBit" in column for column in predicted.columns)
+    assert not ({column for column in predicted if "Pretreat" in column} -
+                expected_chemistry - {c for c in frame if "Molarity" in c})
+
+
+def test_interaction_limits_follow_group_count_and_target_is_not_used():
+    engine = chemistry.ChemistryFeatureEngineer()
+    small, small_groups = automatic_frame(100, 4)
+    large, large_groups = automatic_frame(200, 4)
+    small_a = engine.auto_configure(
+        small, groups=small_groups, target=pd.Series(np.arange(100)))
+    small_b = engine.auto_configure(
+        small, groups=small_groups, target=pd.Series(np.arange(100)[::-1]))
+    large_config = engine.auto_configure(large, groups=large_groups)
+    assert len(small_a.selected_interactions) <= 3
+    assert len(large_config.selected_interactions) <= 6
+    assert small_a.selected_descriptor_keys == small_b.selected_descriptor_keys
+    assert small_a.selected_interactions == small_b.selected_interactions
     

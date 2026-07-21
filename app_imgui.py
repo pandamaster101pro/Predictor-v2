@@ -30,6 +30,7 @@ The trained model can be saved to / loaded from 'model.joblib'.
 import sys
 import threading
 import importlib.util
+from dataclasses import asdict
 
 
 # -----------------------------------------------------------------------------
@@ -425,7 +426,8 @@ def draw_recipe_inputs(id_prefix, mark_dirty=False):
 
 def _chemistry_model_columns():
     columns = set(STATE.chemistry_schema.get("interactions", []))
-    for info in STATE.chemistry_schema.get("columns", {}).values():
+    for source, info in STATE.chemistry_schema.get("columns", {}).items():
+        columns.add(source)
         columns.update(info.get("descriptor_columns", []))
     return columns
 
@@ -572,6 +574,17 @@ def build_training_data(cfg, notes=None):
         raise ValueError(f"Grouping column '{group_column}' was not found in the dataset.")
     groups = (raw_df[group_column].copy() if group_column in raw_df.columns
               else pd.Series(np.arange(len(raw_df)), name="row"))
+    chemistry_groups = groups.copy()
+    if not grouped:
+        # An experiment ID still defines independent chemistry support even when
+        # random K-fold validation was selected.
+        chemistry_group_column = next(
+            (c for c in cfg.get("ids", []) if c in raw_df.columns and
+             1 < raw_df[c].nunique(dropna=True) < len(raw_df)), None)
+        if chemistry_group_column:
+            chemistry_groups = raw_df[chemistry_group_column].copy()
+            log(f"Chemistry feature budgeting uses {chemistry_groups.nunique()} independent "
+                f"groups from ID column '{chemistry_group_column}'.")
 
     # IDs are never eligible predictors.  The grouping column is held separately
     # even when the user did not also classify it as an ID.
@@ -642,6 +655,7 @@ def build_training_data(cfg, notes=None):
     target_mask = df[targets].notna().all(axis=1)
     df = df.loc[target_mask].reset_index(drop=True)
     groups = groups.loc[target_mask].reset_index(drop=True)
+    chemistry_groups = chemistry_groups.loc[target_mask].reset_index(drop=True)
     log(f"Kept {len(df)}/{n0} rows with an observed target.")
 
     # Drop rows whose features are essentially all blank / 'Unknown'.
@@ -659,6 +673,7 @@ def build_training_data(cfg, notes=None):
     informative_mask = (frac >= MIN_INFORMATIVE_FRAC).to_numpy()
     df = df.loc[informative_mask].reset_index(drop=True)
     groups = groups.loc[informative_mask].reset_index(drop=True)
+    chemistry_groups = chemistry_groups.loc[informative_mask].reset_index(drop=True)
     log(f"Dropped {n1 - len(df)} blank/'Unknown'-only rows -> {len(df)} rows.")
 
     X = df[feat_only].copy()
@@ -669,18 +684,37 @@ def build_training_data(cfg, notes=None):
                         "descriptor_feature_count": 0,
                         "rdkit_available": chemistry.ENGINE.generator.rdkit.available}
     chemistry_originals = pd.DataFrame(index=X.index)
-    if cfg.get("chemistry_enabled", True):
-        expansion = chemistry.ENGINE.transform(X, include_original=False,
-                                               add_interactions=True)
-        X = expansion.frame
-        chemistry_schema = expansion.metadata
-        chemistry_originals = expansion.original_values
-        if chemistry_schema.get("columns"):
-            log(
-                f"Chemistry engine expanded {len(chemistry_schema['columns'])} chemical "
-                f"column(s) into {chemistry_schema['descriptor_feature_count']} descriptors "
-                f"and {len(chemistry_schema['interactions'])} targeted interaction(s)."
-            )
+    requested_mode = cfg.get("chemistry_mode", "automatic")
+    if not cfg.get("chemistry_enabled", True):
+        requested_mode = "off"
+    chemistry_target = (y[targets[0]] if cfg.get("single_target_mode") and targets else None)
+    chemistry_detection = chemistry.ENGINE.detect_column_details(X)
+    detection_overrides = dict(cfg.get("chemistry_column_overrides", {}))
+    chemistry_columns = [
+        item.column for item in chemistry_detection
+        if detection_overrides.get(item.column, item.confidence >= .70)
+    ]
+    chemistry_config = chemistry.ENGINE.auto_configure(
+        X, chemical_columns=chemistry_columns, groups=chemistry_groups,
+        target=chemistry_target, requested_mode=requested_mode)
+    if requested_mode == "custom":
+        chemistry.apply_custom_families(
+            chemistry_config, cfg.get("chemistry_custom_families", []))
+    expansion = chemistry.ENGINE.transform(X, config=chemistry_config)
+    X = expansion.frame
+    chemistry_schema = expansion.metadata
+    chemistry_originals = expansion.original_values
+    chemistry_diagnostics = dict(
+        chemistry_schema.get("chemistry_feature_diagnostics", {}))
+    if chemistry_schema.get("columns"):
+        log(
+            f"Chemistry {chemistry_config.mode} mode selected "
+            f"{chemistry_schema['descriptor_feature_count']} descriptors and "
+            f"{len(chemistry_schema['interactions'])} supported interaction(s) from "
+            f"{chemistry_schema.get('candidate_descriptor_count', 0)} candidates."
+        )
+        for reason in chemistry_config.rationale:
+            log(reason)
 
     # Feature selection: drop too-sparse and too-high-cardinality columns.
     dropped = 0
@@ -721,7 +755,9 @@ def build_training_data(cfg, notes=None):
         "numeric_schema": numeric_schema,
         "categorical_schema": categorical_schema,
         "original_predictors": original_predictor_count,
+        "chemistry_config": chemistry.chemistry_config_as_dict(chemistry_config),
         "chemistry_schema": chemistry_schema,
+        "chemistry_feature_diagnostics": chemistry_diagnostics,
         "chemistry_originals": chemistry_originals.reset_index(drop=True),
     }
 
@@ -811,7 +847,8 @@ def build_models():
 def run_capacity_optimization(data_path, target, excluded, fixed, direction,
                               min_support=3, random_state=RANDOM_STATE, sheet=None,
                               features=None, col_types=None, ids=None, mixed=None,
-                              chemistry_enabled=True):
+                              chemistry_enabled=True, chemistry_schema=None,
+                              chemistry_mode="automatic"):
     """
     Train XGBoost to predict `target` from CONTROLLABLE inputs only, then use
     differential evolution to find the input recipe with the best predicted
@@ -864,10 +901,22 @@ def run_capacity_optimization(data_path, target, excluded, fixed, direction,
     # Column-types Numeric/Categorical assignment (falling back to dtype).
     X_raw = df[controllable].copy()
     if chemistry_enabled:
-        chemistry_expansion = chemistry.ENGINE.transform(
-            X_raw, include_original=False, add_interactions=True)
-        chemistry_schema = chemistry_expansion.metadata
-        X_raw = chemistry_expansion.frame
+        if chemistry_schema and chemistry_schema.get("columns"):
+            saved_schema = dict(chemistry_schema)
+            X_raw = chemistry.ENGINE.transform_with_schema(X_raw, saved_schema)
+            chemistry_schema = saved_schema
+        else:
+            chemistry_config = chemistry.ENGINE.auto_configure(
+                X_raw, groups=pd.Series(np.arange(len(X_raw))),
+                requested_mode=chemistry_mode)
+            chemistry_expansion = chemistry.ENGINE.transform(
+                X_raw, config=chemistry_config)
+            chemistry_schema = chemistry_expansion.metadata
+            X_raw = chemistry_expansion.frame
+        # Optimization occurs in descriptor space; any retained identity label
+        # is mapped back to a feasible known reagent after the search.
+        retained_sources = [c for c in chemistry_schema.get("columns", {}) if c in X_raw]
+        X_raw = X_raw.drop(columns=retained_sources, errors="ignore")
     else:
         chemistry_schema = {"columns": {}, "interactions": []}
     controllable = list(X_raw.columns)
@@ -1051,6 +1100,20 @@ class AppState:
         self.top_feature_count = 20
         self.show_feature_ratio_warnings = True
         self.chemistry_enabled = True
+        self.chemistry_mode_idx = 1        # Off / Automatic / Compact / Standard / Full / Custom
+        self.chemistry_config = {}
+        self.chemistry_feature_diagnostics = {}
+        self.chemistry_detection = []
+        self.chemistry_estimate = {}
+        self.chemistry_full_risk_confirmed = False
+        self.chemistry_column_overrides = {}
+        self.chemistry_custom_families = {
+            family: family in {
+                "acid_base", "functional_groups", "redox",
+                "physical_properties", "confidence"
+            }
+            for family in chemistry.DESCRIPTOR_FAMILIES
+        }
         self.chemistry_pubchem_enabled = False
         self.chemistry_schema = {}
         self.chemistry_originals = None
@@ -1283,6 +1346,8 @@ def _active_targets_from_state():
 
 
 def _training_config_from_state():
+    chemistry_modes = ["off", "automatic", "compact", "standard", "full", "custom"]
+    mode = chemistry_modes[min(STATE.chemistry_mode_idx, len(chemistry_modes) - 1)]
     return dict(
         data_path=STATE.data_path,
         ids=_split_cols(STATE.id_columns),
@@ -1297,6 +1362,12 @@ def _training_config_from_state():
         standardize_units=STATE.standardize_units,
         validation=_validation_config_from_state(),
         chemistry_enabled=STATE.chemistry_enabled,
+        chemistry_mode=mode,
+        chemistry_custom_families=[
+            family for family, enabled in STATE.chemistry_custom_families.items()
+            if enabled
+        ],
+        chemistry_column_overrides=dict(STATE.chemistry_column_overrides),
     )
 
 
@@ -1315,6 +1386,11 @@ def _sync_validation_column_defaults(columns):
 def _set_chemistry_state(schema, originals=None):
     """Publish chemistry metadata and sensible prediction-widget defaults."""
     STATE.chemistry_schema = dict(schema or {})
+    STATE.chemistry_config = dict(STATE.chemistry_schema.get("chemistry_config") or
+                                  STATE.chemistry_config or {})
+    STATE.chemistry_feature_diagnostics = dict(
+        STATE.chemistry_schema.get("chemistry_feature_diagnostics") or
+        STATE.chemistry_feature_diagnostics or {})
     STATE.chemistry_originals = originals
     all_values = []
     for source, info in STATE.chemistry_schema.get("columns", {}).items():
@@ -1435,23 +1511,72 @@ def scan_column_types():
 
 
 def scan_chemical_knowledge(silent=False):
-    """Detect reagent columns and cache the descriptor preview for the UI."""
+    """Auto-configure chemistry from the same rows and roles used for training."""
     if not STATE.data_path:
         if not silent:
             STATE.chemistry_status = "Choose a spreadsheet in the Train tab first."
         return
     try:
-        raw = read_any(STATE.data_path, nrows=500, sheet=_current_sheet())
-        prepared = prepare_raw(raw, _split_cols(STATE.id_columns),
-                               _split_cols(STATE.mixed_column))
+        raw = read_any(STATE.data_path, sheet=_current_sheet()).reset_index(drop=True)
+        validation_cfg = _validation_config_from_state()
+        group_column = validation_cfg.get("group_column", "")
+        id_columns = _split_cols(STATE.id_columns)
+        chemistry_group_column = (
+            group_column if group_column in raw.columns else next(
+                (c for c in id_columns if c in raw.columns and
+                 1 < raw[c].nunique(dropna=True) < len(raw)), None)
+        )
+        groups = (raw[chemistry_group_column].copy() if chemistry_group_column
+                  else pd.Series(np.arange(len(raw)), name="row"))
+        drop_ids = list(dict.fromkeys(id_columns + ([group_column] if group_column else [])))
+        prepared = prepare_raw(raw, drop_ids, _split_cols(STATE.mixed_column))
         if STATE.standardize_units:
+            prepared = units.standardize_units(
+                prepared, protected=set(_active_targets_from_state()) |
+                set(STATE.coltype_map))
             prepared = units.standardize_parsed_mixed(
                 prepared, labels=mixed_feature_labels(_split_cols(STATE.mixed_column)))
-        expansion = chemistry.ENGINE.transform(prepared, include_original=False,
-                                               add_interactions=True)
+        prepared = auto_coerce_numeric(prepared, protected=set(STATE.coltype_map))
+        prepared = apply_col_type_overrides(prepared, STATE.coltype_map)
+        prepared = prepared.drop(columns=_split_cols(STATE.exclude_columns), errors="ignore")
+        targets = [c for c in _active_targets_from_state() if c in prepared.columns]
+        if targets:
+            target_frame = prepared[targets].apply(pd.to_numeric, errors="coerce")
+            mask = target_frame.notna().all(axis=1)
+            prepared = prepared.loc[mask].reset_index(drop=True)
+            groups = groups.loc[mask].reset_index(drop=True)
+        X = prepared.drop(columns=targets, errors="ignore")
+        details = chemistry.ENGINE.detect_column_details(X)
+        STATE.chemistry_detection = [asdict(item) for item in details]
+        columns = [
+            item.column for item in details
+            if STATE.chemistry_column_overrides.get(item.column,
+                                                    item.confidence >= .70)
+        ]
+        modes = ["off", "automatic", "compact", "standard", "full", "custom"]
+        mode = modes[min(STATE.chemistry_mode_idx, len(modes) - 1)]
+        config = chemistry.ENGINE.auto_configure(
+            X, chemical_columns=columns, groups=groups,
+            requested_mode=mode)
+        if mode == "custom":
+            chemistry.apply_custom_families(
+                config, [name for name, enabled in STATE.chemistry_custom_families.items()
+                         if enabled])
+        estimate = chemistry.ENGINE.estimate_feature_counts(X, config, groups=groups)
+        expansion = estimate.pop("expansion")
+        STATE.chemistry_config = chemistry.chemistry_config_as_dict(config)
+        STATE.chemistry_feature_diagnostics = dict(
+            expansion.metadata.get("chemistry_feature_diagnostics", {}))
+        STATE.chemistry_estimate = estimate
         _set_chemistry_state(expansion.metadata, expansion.original_values)
         if not expansion.metadata.get("columns"):
             STATE.chemistry_status = "No chemical columns were detected automatically."
+        else:
+            STATE.chemistry_status = (
+                f"Auto configuration ready: {estimate['chemistry_features']} chemistry "
+                f"feature(s), {estimate['estimated_total_encoded_predictors']} estimated "
+                f"encoded predictors from {estimate['independent_groups']} groups."
+            )
     except Exception as e:  # noqa: BLE001
         STATE.chemistry_status = f"Chemical scan failed: {e}"
 
@@ -1504,7 +1629,15 @@ def apply_json_config(path):
     STATE.show_feature_ratio_warnings = bool(
         spec["reporting"].get("show_feature_ratio_warnings", True))
     chemistry_spec = dict(spec.get("chemistry") or {})
-    STATE.chemistry_enabled = bool(chemistry_spec.get("enabled", True))
+    feature_spec = dict(spec.get("chemistry_features") or {})
+    STATE.chemistry_enabled = bool(feature_spec.get("enabled", True))
+    chemistry_modes = ["off", "automatic", "compact", "standard", "full", "custom"]
+    requested_mode = str(feature_spec.get(
+        "mode", "automatic" if STATE.chemistry_enabled else "off")).lower()
+    STATE.chemistry_mode_idx = (chemistry_modes.index(requested_mode)
+                                if requested_mode in chemistry_modes else 1)
+    STATE.chemistry_column_overrides = dict(
+        feature_spec.get("column_overrides") or {})
     STATE.chemistry_pubchem_enabled = bool(
         chemistry_spec.get("pubchem_enabled", False))
     chemistry.ENGINE.generator.set_pubchem_enabled(STATE.chemistry_pubchem_enabled)
@@ -1554,6 +1687,8 @@ def apply_json_config(path):
             STATE.coltype_map.setdefault(c, "categorical")
 
     sync_roles_to_cfg()
+    if STATE.data_path:
+        scan_chemical_knowledge(silent=True)
     tab = f" · tab '{dataset}'" if dataset and dataset in STATE.sheet_names else ""
     STATE.coltype_status = (
         f"Loaded JSON: {len(targets)} target(s), {len(numerical)} numeric + "
@@ -1592,6 +1727,21 @@ def export_json_config(path):
             "pubchem_enabled": STATE.chemistry_pubchem_enabled,
             "overrides": chemistry.ENGINE.generator.export_overrides(),
         },
+        "chemistry_features": {
+            "enabled": STATE.chemistry_enabled,
+            "mode": ["off", "automatic", "compact", "standard", "full", "custom"][
+                min(STATE.chemistry_mode_idx, 5)],
+            "auto_configure": True,
+            "max_chemistry_features": None,
+            "retain_original_labels": "auto",
+            "rare_category_min_groups": 5,
+            "near_constant_threshold": 0.99,
+            "correlation_threshold": 0.95,
+            "enable_interactions": "auto",
+            "enable_rdkit_descriptors": "auto",
+            "enable_morgan_fingerprints": False,
+            "column_overrides": dict(STATE.chemistry_column_overrides),
+        },
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(spec, f, indent=2, ensure_ascii=False)
@@ -1601,6 +1751,15 @@ def export_json_config(path):
 def start_training():
     """Kick off training on a background thread so the UI stays responsive."""
     if STATE.is_training or not STATE.data_path:
+        return
+    ratio = float(STATE.chemistry_estimate.get(
+        "groups_per_encoded_predictor", math.inf))
+    if (STATE.chemistry_mode_idx == 4 and ratio < 1 and
+            not STATE.chemistry_full_risk_confirmed):
+        STATE.train_error = (
+            "Full chemistry mode has fewer than one independent group per encoded "
+            "predictor. Confirm the high-risk Full-mode warning before training.")
+        STATE.status = "Training confirmation required."
         return
     STATE.is_training = True
     STATE.trained = False
@@ -1695,6 +1854,9 @@ def _train_worker(cfg):
         STATE.cfg = dict(cfg)
         STATE.feature_labels = mixed_feature_labels(cfg["mixed"])
         STATE.feature_labels.update(_chemistry_feature_labels(data["chemistry_schema"]))
+        STATE.chemistry_config = dict(data.get("chemistry_config") or {})
+        STATE.chemistry_feature_diagnostics = dict(
+            data.get("chemistry_feature_diagnostics") or {})
         _set_chemistry_state(data["chemistry_schema"], data["chemistry_originals"])
         STATE.metrics = metrics
         STATE.metric_distributions = evaluation["metric_distributions"]
@@ -1900,6 +2062,9 @@ def start_optimize():
         ids=ids,
         mixed=mixed,
         chemistry_enabled=STATE.chemistry_enabled,
+        chemistry_schema=STATE.chemistry_schema,
+        chemistry_mode=["off", "automatic", "compact", "standard", "full", "custom"][
+            min(STATE.chemistry_mode_idx, 5)],
     )
     threading.Thread(target=_optimize_worker, args=(cfg,), daemon=True).start()
 
@@ -1912,7 +2077,9 @@ def _optimize_worker(cfg):
             cfg["fixed"], cfg["direction"], sheet=cfg.get("sheet"),
             features=cfg.get("features"), col_types=cfg.get("col_types"),
             ids=cfg.get("ids"), mixed=cfg.get("mixed"),
-            chemistry_enabled=cfg.get("chemistry_enabled", True))
+            chemistry_enabled=cfg.get("chemistry_enabled", True),
+            chemistry_schema=cfg.get("chemistry_schema"),
+            chemistry_mode=cfg.get("chemistry_mode", "automatic"))
         STATE.opt_result = res
         src = ("column-type roles" if res.get("mode") == "column-type"
                else "manual exclusions")
@@ -2371,11 +2538,20 @@ def _intel_worker(cfg, opts):
         if STATE.chemistry_enabled:
             original_cat, original_num = cfg.feature_columns(list(df.columns))
             feature_frame = df[original_cat + original_num].copy()
-            expansion = chemistry.ENGINE.transform(
-                feature_frame, include_original=False, add_interactions=True)
-            if expansion.metadata.get("columns"):
-                chemical_sources = set(expansion.metadata["columns"])
+            if STATE.chemistry_schema.get("columns"):
+                chemistry_schema = STATE.chemistry_schema
+                exp_frame = chemistry.ENGINE.transform_with_schema(
+                    feature_frame, chemistry_schema).reset_index(drop=True)
+            else:
+                modes = ["off", "automatic", "compact", "standard", "full", "custom"]
+                config = chemistry.ENGINE.auto_configure(
+                    feature_frame, groups=pd.Series(np.arange(len(feature_frame))),
+                    requested_mode=modes[min(STATE.chemistry_mode_idx, 5)])
+                expansion = chemistry.ENGINE.transform(feature_frame, config=config)
+                chemistry_schema = expansion.metadata
                 exp_frame = expansion.frame.reset_index(drop=True)
+            if chemistry_schema.get("columns"):
+                chemical_sources = set(chemistry_schema["columns"])
                 # Merge the expanded columns in one concat (adding them one by one
                 # fragments the DataFrame); drop any pre-existing duplicates first.
                 drop = [c for c in df.columns
@@ -2599,9 +2775,10 @@ def build_matrix(X_raw):
                                         or STATE.chemistry_values.get(source, "Unknown"))
                 else:
                     prepared[source] = "Unknown"
-        prepared = chemistry.ENGINE.transform(
-            prepared, chemistry_columns, include_original=False,
-            add_interactions=True).frame
+        # Prediction must use the deployable model's exact selected chemistry
+        # schema; never auto-configure from a single candidate row.
+        prepared = chemistry.ENGINE.transform_with_schema(
+            prepared, STATE.chemistry_schema)
 
     # Apply the exact final-model schema after descriptor expansion.
     cols = {}
@@ -2706,7 +2883,9 @@ def save_model():
             "oof_prediction_samples": STATE.oof_prediction_samples,
             "oof_truth": STATE.oof_truth,
             "preprocessing": STATE.preprocessing_statement,
+            "chemistry_config": STATE.chemistry_config,
             "chemistry_schema": STATE.chemistry_schema,
+            "chemistry_feature_diagnostics": STATE.chemistry_feature_diagnostics,
             "chemistry_originals": STATE.chemistry_originals,
             "chemistry_overrides": chemistry.ENGINE.generator.export_overrides(),
             "chemistry_enabled": STATE.chemistry_enabled,
@@ -2778,6 +2957,13 @@ def load_model():
     STATE.oof_truth = b.get("oof_truth")
     STATE.preprocessing_statement = b.get("preprocessing", "Legacy model; preprocessing scope not recorded")
     STATE.chemistry_enabled = bool(b.get("chemistry_enabled", False))
+    STATE.chemistry_config = dict(b.get("chemistry_config") or {})
+    STATE.chemistry_feature_diagnostics = dict(
+        b.get("chemistry_feature_diagnostics") or {})
+    loaded_mode = str(STATE.chemistry_config.get(
+        "mode", "automatic" if STATE.chemistry_enabled else "off")).lower()
+    modes = ["off", "automatic", "compact", "standard", "full", "custom"]
+    STATE.chemistry_mode_idx = modes.index(loaded_mode) if loaded_mode in modes else 1
     STATE.chemistry_pubchem_enabled = bool(b.get("chemistry_pubchem_enabled", False))
     chemistry.ENGINE.generator.set_pubchem_enabled(STATE.chemistry_pubchem_enabled)
     chemistry.ENGINE.generator.clear_overrides()
@@ -2902,7 +3088,9 @@ def export_screen_report(path, kind):
             "metric_distributions": STATE.metric_distributions,
             "feature_diagnostics": STATE.feature_diagnostics,
             "preprocessing": STATE.preprocessing_statement,
+            "chemistry_config": STATE.chemistry_config,
             "chemistry_schema": STATE.chemistry_schema,
+            "chemistry_feature_diagnostics": STATE.chemistry_feature_diagnostics,
             "chemistry_overrides": chemistry.ENGINE.generator.export_overrides(),
         }
         if kind == "pdf":
@@ -3032,6 +3220,42 @@ def draw_train_tab():
     imgui.same_line()
     imgui.text_colored(DIM, "'2 h' -> 120 min, K -> C, '3.2%V H2SO4' -> mol/L; "
                             "off = use values exactly as in the sheet")
+
+    chemistry_modes = [
+        "Off", "Automatic - recommended", "Compact", "Standard", "Full", "Custom"
+    ]
+    imgui.set_next_item_width(260)
+    changed, STATE.chemistry_mode_idx = imgui.combo(
+        "Chemistry feature mode", STATE.chemistry_mode_idx, chemistry_modes)
+    STATE.chemistry_enabled = STATE.chemistry_mode_idx != 0
+    if changed:
+        STATE.chemistry_full_risk_confirmed = False
+        if STATE.data_path:
+            scan_chemical_knowledge(silent=True)
+    if STATE.chemistry_mode_idx == 5 and imgui.tree_node("Custom descriptor families"):
+        for family in chemistry.DESCRIPTOR_FAMILIES:
+            selected = bool(STATE.chemistry_custom_families.get(family, False))
+            changed_family, selected = imgui.checkbox(
+                family.replace("_", " ").title(), selected)
+            if changed_family:
+                STATE.chemistry_custom_families[family] = selected
+        imgui.tree_pop()
+    estimate = STATE.chemistry_estimate
+    if estimate:
+        ratio = estimate.get("groups_per_encoded_predictor", 0.0)
+        risk = estimate.get("risk", "Caution")
+        color = GREEN if risk == "Good" else (RED if risk == "High risk" else ORANGE)
+        imgui.text_wrapped(
+            f"Pre-training estimate: {estimate.get('original_predictors', 0)} original | "
+            f"{estimate.get('estimated_numeric_descriptors', 0)} chemistry numeric | "
+            f"{estimate.get('estimated_categorical_dummy_columns', 0)} chemistry dummies | "
+            f"{estimate.get('estimated_total_encoded_predictors', 0)} encoded total")
+        imgui.text_colored(
+            color, f"{risk}: {ratio:.2f} independent groups per encoded predictor")
+        if STATE.chemistry_mode_idx == 4 and ratio < 1:
+            _, STATE.chemistry_full_risk_confirmed = imgui.checkbox(
+                "I understand Full chemistry mode is high risk for this dataset",
+                STATE.chemistry_full_risk_confirmed)
 
     imgui.dummy(imgui.ImVec2(0, 6))
     imgui.text("3) Validation settings")
@@ -4556,8 +4780,13 @@ def draw_chemical_knowledge_tab():
         "formula, functional-class, elemental, physicochemical and optional RDKit descriptors."
     )
     imgui.separator()
-    _, STATE.chemistry_enabled = imgui.checkbox(
+    changed_enabled, STATE.chemistry_enabled = imgui.checkbox(
         "Enable chemistry-aware feature engineering", STATE.chemistry_enabled)
+    if changed_enabled:
+        if not STATE.chemistry_enabled:
+            STATE.chemistry_mode_idx = 0
+        elif STATE.chemistry_mode_idx == 0:
+            STATE.chemistry_mode_idx = 1
     changed, pubchem_enabled = imgui.checkbox(
         "Allow PubChem lookup for unrecognized names (internet)",
         STATE.chemistry_pubchem_enabled)
@@ -4575,10 +4804,47 @@ def draw_chemical_knowledge_tab():
         if chemistry.ENGINE.generator.rdkit.available
         else "RDKit: unavailable - internal lookup and formula heuristics remain active"
     )
-    if imgui.button("Scan loaded dataset", size=imgui.ImVec2(180, 0)):
+    if imgui.button("Auto configure chemistry", size=imgui.ImVec2(210, 0)):
         scan_chemical_knowledge()
     imgui.same_line()
     imgui.text_colored(DIM, STATE.chemistry_status)
+
+    estimate = STATE.chemistry_estimate
+    if estimate:
+        interactions = len(STATE.chemistry_schema.get("interactions", []))
+        labels_retained = bool(STATE.chemistry_schema.get("retain_original_labels", False))
+        imgui.text_wrapped(
+            f"Independent groups: {estimate.get('independent_groups', 0)}  |  "
+            f"Chemical columns detected: {len(STATE.chemistry_schema.get('columns', {}))}  |  "
+            f"Candidate descriptors: {STATE.chemistry_schema.get('candidate_descriptor_count', 0)}")
+        imgui.text_wrapped(
+            f"Selected chemistry features: {estimate.get('chemistry_features', 0)}  |  "
+            f"Selected interactions: {interactions}  |  "
+            f"Original chemical labels retained: {'Yes' if labels_retained else 'No'}  |  "
+            f"Estimated total encoded predictors: "
+            f"{estimate.get('estimated_total_encoded_predictors', 0)}")
+        for reason in STATE.chemistry_schema.get("rationale", []):
+            imgui.bullet_text(str(reason))
+        omitted = STATE.chemistry_schema.get("omitted_interactions", [])
+        if omitted and imgui.tree_node("Omitted interaction details"):
+            for feature, reason in omitted:
+                imgui.bullet_text(f"{chemistry.descriptor_display_name(feature)}: {reason}")
+            imgui.tree_pop()
+
+    detections = list(STATE.chemistry_detection)
+    if detections and imgui.tree_node("Chemical-column detection review"):
+        for item in detections:
+            column = item["column"]
+            automatic = float(item["confidence"]) >= .70
+            selected = bool(STATE.chemistry_column_overrides.get(column, automatic))
+            changed_column, selected = imgui.checkbox(
+                f"{column} ({float(item['confidence']):.2f})##chem_detect_{column}", selected)
+            if changed_column:
+                STATE.chemistry_column_overrides[column] = selected
+            imgui.same_line()
+            imgui.text_colored(DIM, str(item.get("reason", "")))
+        imgui.text_colored(DIM, "Click Auto configure chemistry to apply detection overrides.")
+        imgui.tree_pop()
     if not STATE.chemical_knowledge:
         imgui.text_wrapped(
             "No chemicals are listed yet. Load a dataset and scan it, or train once "
