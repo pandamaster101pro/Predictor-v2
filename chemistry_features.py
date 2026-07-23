@@ -10,15 +10,35 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, replace
 from functools import lru_cache
+import importlib.util
 import json
 import math
 import re
 from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import quote
-from urllib.request import urlopen
+from urllib.request import build_opener, HTTPErrorProcessor
 
 import numpy as np
 import pandas as pd
+
+
+class _NoRaiseHTTPErrorProcessor(HTTPErrorProcessor):
+    """Pass HTTP error responses (4xx/5xx) through instead of raising.
+
+    A PubChem "compound not found" is a normal 404 response, not a real
+    error — the default urllib opener raises HTTPError for it, which would
+    otherwise trip a debugger's "raise exceptions" breakpoint on every
+    single lookup miss. Genuine network failures (DNS, timeout, connection
+    refused) still raise via URLError as usual.
+    """
+
+    def http_response(self, _request, response):
+        return response
+
+    https_response = http_response
+
+
+_HTTP_OPENER = build_opener(_NoRaiseHTTPErrorProcessor)
 
 
 UNKNOWN_TOKENS = {"", "unknown", "missing", "na", "n/a", "nan", "?", "unspecified"}
@@ -395,11 +415,11 @@ class RDKitInterface:
     }
 
     def __init__(self):
-        try:
-            import rdkit  # noqa: F401
-            self.available = True
-        except Exception:
-            self.available = False
+        # Check availability without importing — RDKit is an optional, heavy
+        # dependency and this class must not raise just to detect its absence
+        # (a raise-and-catch here fires debugger "on raised exception" breaks
+        # every time the app starts on a machine without RDKit installed).
+        self.available = importlib.util.find_spec("rdkit") is not None
 
     @lru_cache(maxsize=512)
     def describe(self, smiles: str) -> dict[str, float]:
@@ -463,7 +483,11 @@ class PubChemInterface:
             f"{quote(text, safe='')}/property/Title,MolecularFormula,CanonicalSMILES/JSON"
         )
         try:
-            with urlopen(url, timeout=self.timeout) as response:  # noqa: S310 - fixed PubChem host
+            # noqa: S310 - fixed PubChem host; _HTTP_OPENER never raises for a
+            # plain 404 ("name not found" is a normal, expected response here).
+            with _HTTP_OPENER.open(url, timeout=self.timeout) as response:
+                if response.status != 200:
+                    return None
                 payload = json.loads(response.read().decode("utf-8"))
             item = payload["PropertyTable"]["Properties"][0]
             formula = str(item.get("MolecularFormula", "")).strip()
@@ -524,7 +548,7 @@ class DescriptorGenerator:
         return {k: dict(v) for k, v in self.overrides.items()}
 
     @lru_cache(maxsize=2048)
-    def describe(self, value: str) -> ChemicalDescriptor:
+    def describe(self, value: str, allow_pubchem: bool = True) -> ChemicalDescriptor:
         raw = str(value if value is not None else "Unknown").strip()
         normalized = _norm(raw)
         formula_hint = ""
@@ -544,7 +568,8 @@ class DescriptorGenerator:
             source, confidence = ("lookup", 1.0) if record else ("formula_heuristic", .68)
         if record is None:
             formula = formula_hint or self.lookup.formula_from_text(raw)
-            remote = self.pubchem.lookup(raw) if not formula else None
+            remote = (self.pubchem.lookup(raw)
+                     if (allow_pubchem and not formula) else None)
             if remote:
                 record = replace(
                     self._infer_record(remote["name"], remote["formula"]),
@@ -712,8 +737,9 @@ class DescriptorGenerator:
                 return label
         return "Organic compound" if "organic" in tags else "Inorganic compound"
 
-    def similarities(self, value: str, top: int = 3) -> list[ChemicalSimilarity]:
-        query = self.describe(str(value))
+    def similarities(self, value: str, top: int = 3,
+                     allow_pubchem: bool = True) -> list[ChemicalSimilarity]:
+        query = self.describe(str(value), allow_pubchem=allow_pubchem)
         q = self._similarity_vector(query)
         results = []
         for record in self.lookup.records:
@@ -791,7 +817,7 @@ class ChemistryFeatureEngineer:
                       if _norm(v) and _norm(v) not in blankish]
             if not sample:
                 continue
-            descriptions = [self.generator.describe(v) for v in sample]
+            descriptions = [self.generator.describe(v, allow_pubchem=False) for v in sample]
             recognized = float(np.mean([d.confidence >= 0.65 for d in descriptions]))
             formula_fraction = float(np.mean([
                 bool(self.generator.lookup.formula_from_text(v)) for v in sample]))
@@ -857,7 +883,8 @@ class ChemistryFeatureEngineer:
         feature_to_key: dict[str, str] = {}
         for column in chemical_columns:
             prefix = self.prefix(column)
-            descriptors = [self.generator.describe(str(value)) for value in frame[column]]
+            descriptors = [self.generator.describe(str(value), allow_pubchem=False)
+                           for value in frame[column]]
             if not descriptors:
                 continue
             for key in descriptors[0].feature_values():
@@ -940,7 +967,8 @@ class ChemistryFeatureEngineer:
         metadata = {"columns": {}, "interactions": [], "interaction_specs": []}
         for column in chemical_columns:
             prefix = self.prefix(column)
-            descriptors = [self.generator.describe(str(value)) for value in frame[column]]
+            descriptors = [self.generator.describe(str(value), allow_pubchem=False)
+                           for value in frame[column]]
             names = []
             for key in required:
                 feature = f"{prefix}_{key}"
@@ -1217,7 +1245,8 @@ class ChemistryFeatureEngineer:
         drop_columns: list[str] = []
         for column in chemical_columns:
             prefix = self.prefix(column)
-            descriptors = [self.generator.describe(str(value)) for value in source[column]]
+            descriptors = [self.generator.describe(str(value), allow_pubchem=False)
+                           for value in source[column]]
             feature_names: list[str] = []
             descriptor_keys: list[str] = []
             if descriptors:
@@ -1359,7 +1388,8 @@ class ChemistryFeatureEngineer:
                 marker = prefix + "_"
                 keys = [name[len(marker):] for name in info.get("descriptor_columns", [])
                         if str(name).startswith(marker)]
-            descriptors = [self.generator.describe(str(value)) for value in source[column]]
+            descriptors = [self.generator.describe(str(value), allow_pubchem=False)
+                           for value in source[column]]
             expected = set(info.get("descriptor_columns", []))
             for key in keys:
                 feature = f"{prefix}_{key}"
@@ -1433,13 +1463,25 @@ class ChemistryFeatureEngineer:
             "expansion": expansion,
         }
 
-    def knowledge_for_values(self, values: Iterable[Any]) -> list[dict[str, Any]]:
+    def knowledge_for_values(self, values: Iterable[Any],
+                             allow_pubchem: bool = False) -> list[dict[str, Any]]:
+        """Describe every distinct value (bulk scan).
+
+        ``allow_pubchem`` defaults to False here specifically: this method
+        iterates every observed chemical in a dataset, potentially dozens at
+        once, and runs synchronously on the caller's thread (including the
+        GUI's render thread). Allowing PubChem here would mean one sequential
+        blocking network round-trip per unrecognized name, freezing the whole
+        app for the total time. A single deliberate lookup still goes through
+        ``DescriptorGenerator.describe()`` directly, which defaults to True.
+        """
         rows = []
         for value in sorted(set(map(str, values))):
-            descriptor = self.generator.describe(value)
+            descriptor = self.generator.describe(value, allow_pubchem=allow_pubchem)
             rows.append({
                 "original": value, "descriptor": descriptor,
-                "similarities": self.generator.similarities(value, top=3),
+                "similarities": self.generator.similarities(
+                    value, top=3, allow_pubchem=allow_pubchem),
             })
         return rows
 

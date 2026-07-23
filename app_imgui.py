@@ -104,6 +104,22 @@ import slideshow
 import validation as V
 import chemistry_features as chemistry
 
+# Pre-warm heavy, complex optional imports ONCE, here, on the main thread —
+# before immapp.run() / main() ever starts, so before any background worker
+# thread can exist. Charts, Latent, Dataset Intelligence, and Optimize each
+# independently do `import charts` inside their OWN threading.Thread body;
+# charts.py in turn lazily imports shap (which pulls in IPython/tqdm) the
+# first time a SHAP chart runs. If two of those threads raced to import the
+# same complex package for the first time simultaneously, Python's shared
+# sys.modules state could produce "partially initialized module ... circular
+# import" errors. Doing it once, up front, single-threaded, makes every later
+# `import charts`/`import shap` a cheap no-op instead of a race.
+import charts  # noqa: F401 - matplotlib(Agg) side effect; also used directly below
+try:
+    import shap  # noqa: F401
+except ImportError:
+    pass
+
 MODEL_OUT = "model.joblib"
 RANDOM_STATE = 42
 
@@ -3343,7 +3359,7 @@ def draw_train_tab():
     if STATE.train_error:
         imgui.text_wrapped(STATE.train_error)
 
-    # Results.
+    # Results.coo
     if STATE.trained:
         imgui.separator()
         imgui.text_colored(GREEN, STATE.summary)
@@ -3784,6 +3800,7 @@ def _draw_dataframe(df):
                 imgui.table_next_column()
                 imgui.text(str(value))
         imgui.end_table()
+         
 
 
 def draw_optimize_tab():

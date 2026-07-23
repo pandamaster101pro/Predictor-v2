@@ -602,7 +602,10 @@ class Screener:
             identity.discard("")
             exact_seen = False
             for candidate in observed:
-                known = chemistry.ENGINE.generator.describe(candidate)
+                # Bulk comparison against every chemical seen in training — never
+                # touch PubChem here (these were already resolved during the
+                # offline dataset scan); only the current single value above may.
+                known = chemistry.ENGINE.generator.describe(candidate, allow_pubchem=False)
                 candidate_identity = {
                     norm(candidate), norm(known.canonical_name), norm(known.formula)}
                 if identity & (candidate_identity - {""}):
