@@ -281,7 +281,12 @@ class Screener:
         for i, t in enumerate(self.targets):
             mean = float(point[i])
             forest = self._forests.get(t)
-            if forest is not None:
+            # _extract_forests() also returns a single-target boosted model
+            # (e.g. XGBRegressor) here for SHAP's benefit — those expose
+            # feature_importances_ but have no per-tree .estimators_, so
+            # there is no tree-to-tree spread to compute; fall back to the
+            # purely aleatoric (CV-residual) component in that case.
+            if forest is not None and hasattr(forest, "estimators_"):
                 tree_preds = np.array([tr.predict(X_enc.values)[0] for tr in forest.estimators_])
                 std_ens = float(tree_preds.std())
             else:

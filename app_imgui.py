@@ -103,6 +103,15 @@ import units
 import slideshow
 import validation as V
 import chemistry_features as chemistry
+import cost_model
+import planner
+import research_gap
+import pareto
+import constraint_engine
+import sustainability
+import tradeoffs
+import portfolio
+import bayesopt
 
 # Pre-warm heavy, complex optional imports ONCE, here, on the main thread —
 # before immapp.run() / main() ever starts, so before any background worker
@@ -401,7 +410,6 @@ def apply_recipe_text(group, text):
     if "D" in group:
         chem = units._find_chemical(detail, code)
         _set_widget_categorical(group["D"], chem["label"] if chem else "Missing")
-
 
 def _widget_cat_value(col):
     custom = STATE.screen_custom_category.get(col, "").strip()
@@ -860,15 +868,624 @@ def build_models():
 # =============================================================================
 # CAPACITY OPTIMIZER  —  train on controllable knobs, search for the best recipe
 # =============================================================================
+_RISK_FROM_APPLICABILITY_LABEL = {
+    "well inside the training domain": "Low",
+    "inside the training domain": "Low",
+    "at the edge of the training domain": "Moderate",
+    "OUTSIDE the training domain": "High",
+}
+
+
+def _parse_objectives_text(text, primary_column, primary_direction):
+    """Parse 'column:maximize|minimize:weight' entries (comma- or newline-
+    separated) into a normalized objective list.
+
+    The primary target is always objectives[0] — added automatically with
+    weight 1.0 if not explicitly listed. Weights auto-normalize to sum to 1.
+    An entry with an unparsable weight defaults to 1.0 (equal say). Returns a
+    list with at least one entry (the primary) even given empty/unparsable
+    text, so single-objective callers can treat "no extra objectives" and
+    "objectives=[primary]" identically.
+    """
+    entries = []
+    for part in re.split(r"[,\n]", str(text or "")):
+        part = part.strip()
+        if not part:
+            continue
+        bits = [b.strip() for b in part.split(":")]
+        if len(bits) < 2 or not bits[0]:
+            continue
+        col, raw_dir = bits[0], bits[1].lower()
+        if raw_dir.startswith("max"):
+            d = "maximise"
+        elif raw_dir.startswith("min"):
+            d = "minimise"
+        else:
+            continue
+        try:
+            weight = float(bits[2]) if len(bits) > 2 else 1.0
+        except ValueError:
+            weight = 1.0
+        entries.append({"column": col, "direction": d, "weight": max(weight, 0.0)})
+
+    if not any(e["column"] == primary_column for e in entries):
+        entries.insert(0, {"column": primary_column, "direction": primary_direction,
+                           "weight": 1.0})
+    total = sum(e["weight"] for e in entries) or 1.0
+    for e in entries:
+        e["weight"] = e["weight"] / total
+    return entries
+
+
+def _pareto_front_candidates(archive_vecs, archive_obj, *, objectives, target, model, y,
+                             extra_models, vectorize, decode_vec, annotate_recipe,
+                             feat_cols, X_enc, numeric_cols, cat_choices, X_raw,
+                             chemistry_schema, chemistry_originals_df, label_map,
+                             cv_rmse, cv_r2, min_applicability, fixed,
+                             n_priority_candidates=0, random_state=RANDOM_STATE,
+                             pool_cap=600, max_front=15, process_limits=None):
+    """Non-dominated (Pareto-optimal) recipes across every objective.
+
+    Reuses the same DE-search + training-row-seeded archive the (separate,
+    single-objective) Top-N pass uses, but selects candidates by Pareto
+    dominance across ALL objectives (via ``pareto.non_dominated_sort`` —
+    every rank, not just the optimal front) rather than one weighted
+    utility, then diversity-filters the OPTIMAL front down to ``max_front``
+    points ranked by weighted utility so the result is a genuinely
+    different set of trade-offs, not dozens of near-duplicates.
+
+    Best-effort: any failure returns ``([], [])`` rather than propagating,
+    matching ``_rank_top_recipes``'s contract — the single-best recipe and
+    Top-N list must keep working regardless of whether this succeeds.
+    Returns ``(pareto_points, front_sizes)`` — ``front_sizes[0]`` is the
+    optimal front's size before diversity-filtering down to ``max_front``,
+    ``front_sizes[1:]`` are the next-best ranks' sizes (rank-2 front is
+    optimal only once every rank-1 point is set aside, and so on).
+    """
+    if not archive_vecs or len(objectives) < 2:
+        return [], []
+    all_vecs = np.vstack(archive_vecs)
+    n = len(all_vecs)
+    if n == 0:
+        return [], []
+
+    # Subsample exactly like _rank_top_recipes: priority (training-row-
+    # derived) candidates kept in full, the rest randomly thinned.
+    n_priority_candidates = min(n_priority_candidates, n)
+    split = n - n_priority_candidates
+    idx = np.arange(n)
+    priority_idx, search_idx = idx[split:], idx[:split]
+    search_budget = pool_cap - n_priority_candidates
+    if search_budget < len(search_idx):
+        rng_np = np.random.RandomState(random_state)
+        search_idx = rng_np.choice(search_idx, max(search_budget, 0), replace=False)
+    all_vecs = all_vecs[np.concatenate([priority_idx, search_idx]).astype(int)]
+
+    try:
+        numeric_schema = {c: float(X_raw[c].median()) for c in numeric_cols}
+        screener = screening.Screener(
+            model, feat_cols, numeric_schema, cat_choices, [target],
+            X_enc.astype(float), pd.DataFrame({target: y}, index=X_enc.index),
+            cv_rmse={target: cv_rmse}, cv_r2={target: cv_r2},
+            display_labels=label_map, chemistry_schema=chemistry_schema,
+            chemistry_originals=chemistry_originals_df,
+        )
+    except Exception:  # noqa: BLE001
+        return [], []
+
+    rows = []
+    for vec in all_vecs:
+        try:
+            X_row = pd.DataFrame([vectorize(vec)], columns=feat_cols).astype(float)
+            ad = screener.applicability(X_row)
+        except Exception:  # noqa: BLE001
+            continue
+        applicability_pct = 100.0 - ad["percentile"]
+        if applicability_pct < min_applicability:
+            continue
+        values = {}
+        ok = True
+        recipe_dict = None
+        for obj in objectives:
+            col = obj["column"]
+            try:
+                if col in extra_models:
+                    values[col] = float(extra_models[col].predict(
+                        vectorize(vec).reshape(1, -1))[0])
+                elif col == target:
+                    values[col] = float(model.predict(vectorize(vec).reshape(1, -1))[0])
+                else:               # a controllable-knob objective (e.g. temperature)
+                    if recipe_dict is None:
+                        recipe_dict, _ = decode_vec(vec)
+                    values[col] = float(recipe_dict[col])
+            except (KeyError, TypeError, ValueError):
+                ok = False
+                break
+        if not ok:
+            continue
+        if process_limits:
+            if recipe_dict is None:
+                recipe_dict, _ = decode_vec(vec)
+            if not constraint_engine.satisfies_process(recipe_dict, process_limits):
+                continue
+        rows.append({"vec": vec, "X_row": X_row, "values": values, "ad": ad})
+    if not rows:
+        return [], []
+
+    def score(row, obj):    # "higher is better" for every objective, uniformly
+        v = row["values"][obj["column"]]
+        return v if obj["direction"] == "maximise" else -v
+
+    directions = [o["direction"] for o in objectives]
+    raw_values = [[row["values"][o["column"]] for o in objectives] for row in rows]
+    fronts = pareto.non_dominated_sort(raw_values, directions)
+    if not fronts:
+        return [], []
+    front_idx = fronts[0]
+    front_sizes = [len(f) for f in fronts]
+
+    def weighted_utility(row):
+        return sum(o["weight"] * score(row, o) for o in objectives)
+
+    front = sorted((rows[i] for i in front_idx), key=weighted_utility, reverse=True)
+    diversity_gap = 0.75 * screener._d_ref
+    selected, selected_std = [], []
+    for row in front:
+        if len(selected) >= max(max_front, 1):
+            break
+        std_vec = screener.scaler.transform(row["X_row"].values)[0]
+        if any(np.linalg.norm(std_vec - other) < diversity_gap for other in selected_std):
+            continue
+        selected.append(row)
+        selected_std.append(std_vec)
+
+    # Crowding distance (spacing in objective space) over the FINAL
+    # selected set — informational (surfaced per point as "crowding", e.g.
+    # "most unique trade-off"), not a second selection filter: which
+    # candidates survive is still decided by the applicability-gated,
+    # spatially-diverse pass above (verified against real data), so this
+    # is purely additive.
+    crowd_values = [[row["values"][o["column"]] for o in objectives] for row in selected]
+    crowding = pareto.crowding_distance(crowd_values) if selected else []
+
+    pareto_points = []
+    for rank, (row, crowd) in enumerate(zip(selected, crowding), start=1):
+        recipe_dict, cand_edges = decode_vec(row["vec"])
+        ordered, chem_recs = annotate_recipe(recipe_dict)
+        risk = _RISK_FROM_APPLICABILITY_LABEL.get(row["ad"]["label"], "Moderate")
+        pareto_points.append({
+            "rank": rank, "recipe": ordered, "fixed": set(fixed),
+            "objectives": dict(row["values"]),
+            "applicability_pct": 100.0 - row["ad"]["percentile"],
+            "risk": risk, "utility": weighted_utility(row),
+            "chemical_recommendations": chem_recs, "edges": cand_edges,
+            "crowding": (round(crowd, 3) if np.isfinite(crowd) else None),
+        })
+    return pareto_points, front_sizes
+
+
+def _numeric_categorical_choices(choices):
+    """Sorted (float, original_string) pairs for a categorical knob's
+    numeric-parseable choices, e.g. a temperature column left as text
+    ("700", "750", ..., "Missing") when a sheet mixed numbers with blanks."""
+    out = []
+    for ch in choices:
+        try:
+            out.append((float(ch), ch))
+        except (TypeError, ValueError):
+            continue
+    return sorted(out)
+
+
+def _pick_sensitivity_knobs(spec, cat_choices=None, max_knobs=3):
+    """Choose a few search dimensions to sweep for robustness analysis —
+    preferring named temperature/time/concentration knobs (the variables a
+    researcher most often asks "how sensitive is this to small changes"
+    about), falling back to other numeric dims otherwise. A categorical knob
+    whose choices are mostly numeric-looking text (a temperature column left
+    as strings, say) still qualifies — only genuinely non-orderable
+    categories (reagent names, atmosphere) are excluded.
+    """
+    cat_choices = cat_choices or {}
+
+    def sweepable(s):
+        if s[0] == "num":
+            return True
+        choices = cat_choices.get(s[1], [])
+        numeric = _numeric_categorical_choices(choices)
+        return bool(choices) and len(numeric) / len(choices) >= 0.7
+
+    candidates = [s for s in spec if sweepable(s)]
+    patterns = [re.compile(r"temp|pyro", re.I),
+               re.compile(r"time|holding|hold", re.I),
+               re.compile(r"molar|concentration|conc\b", re.I)]
+    picked = []
+    for pat in patterns:
+        for s in candidates:
+            if s not in picked and pat.search(str(s[1])):
+                picked.append(s)
+                break
+    for s in candidates:
+        if len(picked) >= max_knobs:
+            break
+        if s not in picked:
+            picked.append(s)
+    return picked[:max_knobs]
+
+
+def _sensitivity_analysis(vec, spec, vectorize, model, X_raw, cat_choices=None,
+                          max_knobs=3, n_points=5, frac=0.15):
+    """Sweep a few key knobs around one candidate's value, predicting the
+    target at each point, to show whether the recommendation is robust to
+    small process variations or requires unrealistic precision.
+
+    Numeric knobs sweep continuously (±``frac`` of the observed range);
+    numeric-looking categorical knobs (see ``_pick_sensitivity_knobs``) sweep
+    through the nearest ``n_points`` discrete observed values instead.
+
+    Returns a list of ``{"knob", "center", "sweep": [(value, predicted), ...],
+    "pct_range", "robust"}``. Best-effort: a knob that fails to sweep (e.g. an
+    unusual dtype) is skipped rather than aborting the whole analysis.
+    """
+    cat_choices = cat_choices or {}
+    results = []
+    try:
+        base_pred = float(model.predict(vectorize(vec).reshape(1, -1))[0])
+    except Exception:  # noqa: BLE001
+        return results
+    chosen = _pick_sensitivity_knobs(spec, cat_choices=cat_choices, max_knobs=max_knobs)
+    for i, s in enumerate(spec):
+        if s not in chosen:
+            continue
+        col = s[1]
+        try:
+            if s[0] == "num":
+                lo, hi = float(np.percentile(X_raw[col], 1)), float(np.percentile(X_raw[col], 99))
+                span = (hi - lo) or 1.0
+                center = float(vec[i])
+                delta = frac * span
+                sweep_vals = np.clip(np.linspace(center - delta, center + delta, n_points), lo, hi)
+            else:
+                numeric = _numeric_categorical_choices(cat_choices[col])
+                nvals = [v for v, _ in numeric]
+                cur_idx = max(0, min(int(round(vec[i])), len(s[2]) - 1))
+                center = float(nvals[min(cur_idx, len(nvals) - 1)]) if nvals else 0.0
+                near = sorted(nvals, key=lambda v: abs(v - center))[:n_points]
+                sweep_vals = sorted(near)
+            points = []
+            for sv in sweep_vals:
+                v2 = np.array(vec, dtype=float)
+                if s[0] == "num":
+                    v2[i] = sv
+                else:
+                    numeric = _numeric_categorical_choices(cat_choices[col])
+                    label = next((lbl for v, lbl in numeric if v == sv), None)
+                    if label is None:      # shouldn't happen: sv came from `numeric` itself
+                        continue
+                    v2[i] = cat_choices[col].index(label)
+                pred = float(model.predict(vectorize(v2).reshape(1, -1))[0])
+                points.append((round(float(sv), 4), round(pred, 4)))
+            preds = np.array([p[1] for p in points])
+            pred_range = float(preds.max() - preds.min())
+            pct_range = 100.0 * pred_range / (abs(base_pred) + 1e-9)
+            results.append({"knob": col, "center": round(center, 4), "sweep": points,
+                            "pct_range": round(pct_range, 1), "robust": pct_range < 15.0})
+        except Exception:  # noqa: BLE001
+            continue
+    return results
+
+
+def _reagent_info_for_candidate(candidate):
+    """Per-reagent cost/hazard info (whatever the user has entered) for one
+    candidate's recommended chemicals — informational only, never a
+    fabricated recipe-level total: computing a true total needs the actual
+    mass/volume used, which this optimizer's descriptor-space search doesn't
+    track precisely enough to claim as a real number.
+    """
+    rows = []
+    for rec in candidate.get("chemical_recommendations") or []:
+        name = rec.get("recommended")
+        if not name:
+            continue
+        entry = cost_model.ENGINE.get(name)
+        rows.append({
+            "reagent": name,
+            "cost_per_kg": entry.cost_per_kg if entry else None,
+            "cost_per_liter": entry.cost_per_liter if entry else None,
+            "hazard_class": entry.hazard_class if entry else "Unknown",
+            "corrosive": entry.corrosive if entry else False,
+            "priced": bool(entry and entry.has_cost),
+        })
+    return rows
+
+
+def _sustainability_for_candidate(candidate, X_raw, numeric_cols):
+    """Green Score (see sustainability.py's docstring for what is and
+    isn't scored — never a fabricated hazard/energy fact, only the user's
+    own entered reagent data plus the recipe's own countable structure)
+    for one candidate's decoded recipe."""
+    recipe_dict = dict(candidate.get("recipe", []))
+    chem_names = [rec.get("recommended")
+                 for rec in candidate.get("chemical_recommendations") or []
+                 if rec.get("recommended")]
+    temp_pct = sustainability.estimate_temperature_percentile(recipe_dict, X_raw, numeric_cols)
+    return sustainability.green_score(recipe_dict, chem_names, temperature_percentile=temp_pct)
+
+
+def _rank_top_recipes(archive_vecs, archive_obj, *, target, sign, y, model,
+                      vectorize, decode_vec, annotate_recipe, feat_cols, X_enc,
+                      numeric_cols, cat_choices, X_raw, chemistry_schema,
+                      chemistry_originals_df, label_map, cv_rmse, cv_r2,
+                      top_n, risk_lambda, min_applicability, fixed,
+                      n_priority_candidates=0, random_state=RANDOM_STATE,
+                      pool_cap=800, process_limits=None):
+    """Score every archived DE candidate; return up to `top_n` diverse,
+    in-domain recommendations (see run_capacity_optimization's docstring).
+
+    ``n_priority_candidates`` marks how many entries at the END of the
+    concatenated archive are real-training-row-derived (see the caller) —
+    those are always kept in full rather than being subject to subsampling,
+    since there are at most a few hundred of them and they anchor the pool
+    with genuinely in-domain options.
+
+    Best-effort throughout: any failure here returns an empty list rather
+    than propagating, since the single-best recipe must keep working
+    regardless of whether this richer pass succeeds. Returns
+    (top_recipes, n_candidates_considered).
+    """
+    if not archive_vecs:
+        return [], 0
+    all_vecs = np.vstack(archive_vecs)
+    all_obj = np.concatenate(archive_obj)
+    n_considered = len(all_vecs)
+    if n_considered == 0:
+        return [], 0
+
+    # Cap the expensive per-candidate screening pass to a manageable size —
+    # the DE-search portion of the archive can run into the tens of
+    # thousands of points for a search with many knobs / generations.
+    # Subsample RANDOMLY, not by best-raw-objective: a model will often
+    # predict its most extreme values for combinations that push several
+    # knobs to their bounds simultaneously, so objective-based truncation
+    # would systematically fill the pool with the least trustworthy
+    # (most extrapolated) candidates — exactly what applicability scoring
+    # below is supposed to catch, not what should decide who gets IN.
+    n_priority_candidates = min(n_priority_candidates, len(all_vecs))
+    search_budget = pool_cap - n_priority_candidates
+    if n_priority_candidates > 0:
+        split = len(all_vecs) - n_priority_candidates
+        priority_vecs, priority_obj = all_vecs[split:], all_obj[split:]
+        search_vecs, search_obj = all_vecs[:split], all_obj[:split]
+    else:
+        priority_vecs = priority_obj = np.empty((0,))
+        search_vecs, search_obj = all_vecs, all_obj
+    if search_budget < len(search_vecs):
+        rng_np = np.random.RandomState(random_state)
+        keep = rng_np.choice(len(search_vecs), max(search_budget, 0), replace=False)
+        search_vecs, search_obj = search_vecs[keep], search_obj[keep]
+    if n_priority_candidates > 0:
+        all_vecs = np.vstack([priority_vecs, search_vecs]) if len(search_vecs) else priority_vecs
+        all_obj = np.concatenate([priority_obj, search_obj]) if len(search_obj) else priority_obj
+    else:
+        all_vecs, all_obj = search_vecs, search_obj
+
+    try:
+        numeric_schema = {c: float(X_raw[c].median()) for c in numeric_cols}
+        screener = screening.Screener(
+            model, feat_cols, numeric_schema, cat_choices, [target],
+            X_enc.astype(float), pd.DataFrame({target: y}, index=X_enc.index),
+            cv_rmse={target: cv_rmse}, cv_r2={target: cv_r2},
+            display_labels=label_map, chemistry_schema=chemistry_schema,
+            chemistry_originals=chemistry_originals_df,
+        )
+    except Exception:  # noqa: BLE001 - Top-N is best-effort, never fatal
+        return [], n_considered
+
+    y_range = float(y.max() - y.min()) or 1.0
+    # A candidate must sit at least this far (in the same standardised space
+    # the screener's own nearest-neighbour model uses) from every already-
+    # selected one to count as genuinely different, not a near-duplicate.
+    diversity_gap = 0.75 * screener._d_ref
+
+    scored = []
+    for vec, raw_obj in zip(all_vecs, all_obj):
+        try:
+            X_row = pd.DataFrame([vectorize(vec)], columns=feat_cols).astype(float)
+            unc = screener.uncertainty(X_row)[target]
+            ad = screener.applicability(X_row)
+        except Exception:  # noqa: BLE001
+            continue
+        applicability_pct = 100.0 - ad["percentile"]
+        if applicability_pct < min_applicability:
+            continue
+        if process_limits:
+            cand_recipe, _ = decode_vec(vec)
+            if not constraint_engine.satisfies_process(cand_recipe, process_limits):
+                continue
+        # raw_obj = sign * predicted, so -raw_obj is "higher is better" in
+        # both maximise and minimise directions alike.
+        utility = (-raw_obj
+                  - risk_lambda * unc["sigma"]
+                  - risk_lambda * (ad["percentile"] / 100.0) * y_range)
+        scored.append({"vec": vec, "X_row": X_row, "predicted": sign * raw_obj,
+                       "unc": unc, "ad": ad, "applicability_pct": applicability_pct,
+                       "utility": utility})
+    scored.sort(key=lambda s: s["utility"], reverse=True)
+
+    selected, selected_std = [], []
+    for cand in scored:
+        if len(selected) >= max(int(top_n), 1):
+            break
+        std_vec = screener.scaler.transform(cand["X_row"].values)[0]
+        if any(np.linalg.norm(std_vec - other) < diversity_gap for other in selected_std):
+            continue
+        selected.append(cand)
+        selected_std.append(std_vec)
+
+    top_recipes = []
+    for rank, cand in enumerate(selected, start=1):
+        recipe_dict, cand_edges = decode_vec(cand["vec"])
+        ordered, chem_recs = annotate_recipe(recipe_dict)
+        unc, ad = cand["unc"], cand["ad"]
+        risk = _RISK_FROM_APPLICABILITY_LABEL.get(ad["label"], "Moderate")
+        sim_rows = screener.similar(cand["X_row"], k=1)
+        sim = sim_rows[0] if sim_rows else None
+
+        reason = [ad["label"][:1].upper() + ad["label"][1:] + "."]
+        if sim:
+            measured = sim["measured"].get(target)
+            reason.append(
+                f"Closest known experiment is {sim['similarity']:.0f}% similar"
+                + (f" (measured {measured:.3g})." if measured is not None else "."))
+        if chem_recs:
+            best_chem = max(chem_recs, key=lambda c: c["similarity"])
+            reason.append(f"Uses {best_chem['recommended']} "
+                          f"(descriptor similarity {best_chem['similarity']:.2f}).")
+        reason.append(f"Confidence: {unc['conf_raw']}.")
+        if cand_edges:
+            reason.append("Sits at the edge of the observed range for "
+                          + ", ".join(cand_edges) + ".")
+
+        top_recipes.append({
+            "rank": rank, "recipe": ordered, "fixed": set(fixed),
+            "predicted": cand["predicted"], "lo": unc["lo"], "hi": unc["hi"],
+            "sigma": unc["sigma"], "applicability_pct": cand["applicability_pct"],
+            "risk": risk, "confidence": unc["conf_raw"],
+            "similarity_pct": (sim["similarity"] if sim else None),
+            "nearest_measured": (sim["measured"].get(target) if sim else None),
+            "utility": cand["utility"], "chemical_recommendations": chem_recs,
+            "reason": reason, "edges": cand_edges,
+        })
+    return top_recipes, n_considered
+
+
+def _search_with_archive(objective_fn, bounds, random_state, de_kwargs):
+    """Run one differential-evolution search, returning (best_vec, archive_vecs,
+    archive_obj) — the winning point plus every candidate visited across all
+    generations (not just the final population), for the diversity/Pareto
+    passes downstream.
+
+    Iterates the solver generation-by-generation via scipy's internal
+    ``DifferentialEvolutionSolver`` class instead of the one-shot functional
+    API, so the archive can be captured — this reproduces the functional
+    API's result bit-for-bit for the same seed (verified against
+    ``differential_evolution()`` directly). Falls back to the plain
+    single-best functional search (empty archive) if the internal solver is
+    unavailable for any reason — callers must treat an empty archive as
+    "no diversity/Pareto pass possible, single best still valid".
+    """
+    archive_vecs, archive_obj = [], []
+    try:
+        from scipy.optimize._differentialevolution import DifferentialEvolutionSolver
+        solver = DifferentialEvolutionSolver(
+            objective_fn, bounds, rng=random_state, **de_kwargs)
+        for _nit in range(1, solver.maxiter + 1):
+            try:
+                next(solver)
+            except StopIteration:
+                break
+            archive_vecs.append(np.array(
+                [solver._scale_parameters(p) for p in solver.population]))
+            archive_obj.append(solver.population_energies.copy())
+            if solver.converged():
+                break
+        best_i = int(np.argmin(solver.population_energies))
+        best_vec = solver._scale_parameters(solver.population[best_i])
+    except Exception:  # noqa: BLE001 - fall back to the original, simpler search
+        archive_vecs, archive_obj = [], []
+        result = differential_evolution(objective_fn, bounds, seed=random_state, **de_kwargs)
+        best_vec = result.x
+    return best_vec, archive_vecs, archive_obj
+
+
+def _run_bo_proposals(*, X_enc, y, spec, bounds, integrality, vectorize,
+                      decode_vec, annotate_recipe, direction, target, cv_r2,
+                      cv_rmse, label_map, fixed, n_rows, n_numeric, n_categorical,
+                      column_type_mode, q, xi, random_state):
+    """Fit a Gaussian-process surrogate on the already-built feature space and
+    propose the next ``q`` experiments to run by Expected-Improvement Bayesian
+    optimization. Reuses the exact ``vectorize``/``decode_vec``/``annotate_recipe``
+    machinery the differential-evolution optimizer builds, so the search space,
+    chemistry descriptors and constraints are identical — only the surrogate and
+    the selection criterion differ (probabilistic GP + acquisition, rather than
+    a point-model optimum)."""
+    notes = []
+    bo_direction = "maximize" if direction == "maximise" else "minimize"
+    y_best = float(y.max()) if direction == "maximise" else float(y.min())
+    proposals = []
+    if not bounds:
+        notes.append("No free knobs to vary — every controllable column is "
+                     "fixed or constant, so there is nothing to propose.")
+    else:
+        surrogate = bayesopt.fit_surrogate(
+            X_enc.astype(float).values, y, direction=bo_direction,
+            random_state=random_state)
+        raw = bayesopt.propose_batch(
+            surrogate, bounds, lambda v: vectorize(v), q=q,
+            integrality=integrality, xi=xi, random_state=random_state,
+            de_kwargs=dict(popsize=12, maxiter=40))
+        for rank, p in enumerate(raw, start=1):
+            recipe_, edges_ = decode_vec(p.x)
+            ordered_, chem_recs_ = annotate_recipe(recipe_)
+            # Expected improvement over the best result observed so far, in the
+            # target's own units (EI itself is in internal maximization space).
+            proposals.append({
+                "rank": rank, "recipe": ordered_, "fixed": set(fixed),
+                "predicted": p.mean, "sigma": p.sigma, "ei": p.ei,
+                "lo": p.mean - 1.96 * p.sigma, "hi": p.mean + 1.96 * p.sigma,
+                "edges": edges_, "chemical_recommendations": chem_recs_,
+            })
+    return dict(
+        bo=True, target=target, direction=direction,
+        r2=cv_r2, rmse=cv_rmse, n_rows=n_rows, n_knobs=len(spec),
+        n_numeric=n_numeric, n_categorical=n_categorical,
+        obs_min=float(y.min()), obs_max=float(y.max()), y_best=y_best,
+        labels=label_map, proposals=proposals, notes=notes,
+        mode=("column-type" if column_type_mode else "manual"))
+
+
 def run_capacity_optimization(data_path, target, excluded, fixed, direction,
                               min_support=3, random_state=RANDOM_STATE, sheet=None,
                               features=None, col_types=None, ids=None, mixed=None,
                               chemistry_enabled=True, chemistry_schema=None,
-                              chemistry_mode="automatic"):
+                              chemistry_mode="automatic",
+                              top_n=10, risk_lambda=1.0, min_applicability=60.0,
+                              constraints_text="", objectives_text="",
+                              bayesopt_mode=False, bo_batch=5, bo_xi=0.01,
+                              run_de=True):
     """
     Train XGBoost to predict `target` from CONTROLLABLE inputs only, then use
     differential evolution to find the input recipe with the best predicted
     target. `fixed` pins chosen knobs (e.g. a test current density).
+
+    Beyond the single best recipe, also returns ``top_recipes``: up to
+    ``top_n`` diverse, in-domain candidates pulled from every generation the
+    search visited (not just the final, converged population), each scored
+    with a screening.Screener built from this optimizer's own model so the
+    same uncertainty/applicability/similarity machinery used elsewhere in the
+    app backs the recommendations. ``risk_lambda`` penalises both prediction
+    uncertainty and how far a candidate sits from the training domain (an
+    XGBoost point-model has no per-sample epistemic variance the way a forest
+    does, so the domain-distance term is what actually keeps the ranking from
+    just picking whatever extrapolates furthest). ``min_applicability`` (0-100)
+    rejects candidates below that in-domain score outright.
+
+    ``constraints_text``: one laboratory constraint per line (see
+    ``constraint_engine.parse``), tightening the search space itself before
+    any candidate is generated — e.g. ``"Temperature <= 1000\\nBiomass IN
+    [Rice husk, Bamboo]\\nNO STRONG ACID\\nstages <= 2"``.
+
+    ``objectives_text``: 'column:maximize|minimize:weight' entries (see
+    ``_parse_objectives_text``). When it names more than just the primary
+    target, a SECOND, separate multi-objective search runs (the single-best
+    recipe and Top-N list above are always driven by the primary target
+    alone, unaffected) and its result is returned as ``pareto_front`` —
+    non-dominated recipes across every named objective, each showing every
+    objective's value so you can see the actual trade-offs rather than one
+    compromise point. Outcome-type objectives (e.g. a second measured
+    property) get their own trained model; objectives that name a
+    controllable knob itself (e.g. "minimise Temperature") need no model —
+    read directly from the candidate.
 
     Which columns are controllable is driven by the Column-types configuration
     when available: pass ``features`` (the columns tagged role='Feature') and
@@ -930,11 +1547,16 @@ def run_capacity_optimization(data_path, target, excluded, fixed, direction,
             chemistry_schema = chemistry_expansion.metadata
             X_raw = chemistry_expansion.frame
         # Optimization occurs in descriptor space; any retained identity label
-        # is mapped back to a feasible known reagent after the search.
+        # is mapped back to a feasible known reagent after the search. Snapshot
+        # the original chemical names first so the screening engine (used for
+        # the Top-N recommendation pass below) can still show real reagent
+        # names in "nearest known experiment" lookups.
         retained_sources = [c for c in chemistry_schema.get("columns", {}) if c in X_raw]
+        chemistry_originals_df = X_raw[retained_sources].copy() if retained_sources else None
         X_raw = X_raw.drop(columns=retained_sources, errors="ignore")
     else:
         chemistry_schema = {"columns": {}, "interactions": []}
+        chemistry_originals_df = None
     controllable = list(X_raw.columns)
 
     # Fixed chemical names become fixed descriptor profiles; the optimizer never
@@ -969,6 +1591,37 @@ def run_capacity_optimization(data_path, target, excluded, fixed, direction,
             cat_choices[c] = sorted(counts[counts >= min_support].index.tolist()) \
                 or sorted(counts.index.tolist())
 
+    # Laboratory constraints (temperature <= 1000, forbidden reagents, only
+    # certain biomass, chemical-class shortcuts like "NO STRONG ACID",
+    # process shortcuts like "stages <= 2", ...) tighten the search space
+    # itself — an eliminated candidate is never generated in the first
+    # place, rather than generated and then filtered out after the fact.
+    # Process shortcuts are the one exception: stage/step count is a
+    # property of the DECODED recipe, not a single search dimension, so
+    # they're checked per-candidate later (see process_limits below).
+    constraint_notes = []
+    numeric_overrides = {}
+    parsed_constraints = constraint_engine.parse(constraints_text)
+    process_limits = constraint_engine.process_limits(parsed_constraints)
+    if parsed_constraints:
+        expanded_constraints, chem_notes = constraint_engine.expand_chemical_constraints(
+            parsed_constraints, chemistry_schema)
+        constraint_notes.extend(chem_notes)
+        numeric_overrides, column_notes = constraint_engine.apply(
+            expanded_constraints, numeric_cols, cat_choices, X_raw, by_label)
+        constraint_notes.extend(column_notes)
+        for c in parsed_constraints:
+            if c.get("kind") == "process":
+                constraint_notes.append(f"{c['column']} {c['op']} {c['value']}")
+                continue
+            if c.get("kind") != "column":
+                continue
+            col = by_label.get(c["column"], c["column"])
+            if col in fixed:
+                constraint_notes.append(
+                    f"'{c['column']}' is a fixed knob — its constraint isn't "
+                    "checked against the pinned value.")
+
     # Interaction columns stay in the fitted model but are derived inside each
     # optimizer evaluation; they are not independent knobs a user could set.
     interaction_columns = set(chemistry_schema.get("interactions", []))
@@ -982,10 +1635,70 @@ def run_capacity_optimization(data_path, target, excluded, fixed, direction,
     model = XGBRegressor(n_estimators=400, max_depth=4, learning_rate=0.05,
                          subsample=0.8, colsample_bytree=0.8,
                          random_state=random_state, n_jobs=-1, verbosity=0)
-    cv_r2 = float(r2_score(y, cross_val_predict(
+    oof_pred = cross_val_predict(
         model, X_enc.astype(float).values, y,
-        cv=KFold(5, shuffle=True, random_state=random_state))))
+        cv=KFold(5, shuffle=True, random_state=random_state))
+    cv_r2 = float(r2_score(y, oof_pred))
+    cv_rmse = float(np.sqrt(mean_squared_error(y, oof_pred)))
     model.fit(X_enc.astype(float).values, y)
+
+    # Multi-objective setup. objectives[0] is always the primary target above;
+    # additional entries either name a controllable knob (no model needed —
+    # read directly from a candidate) or a second measured/outcome column
+    # (gets its own trained model, reusing the same encoded feature space).
+    objectives = _parse_objectives_text(objectives_text, target, direction)
+    extra_models, objective_notes = {}, []
+    if len(objectives) > 1:
+        keep_objectives = [objectives[0]]
+        for obj in objectives[1:]:
+            col = obj["column"]
+            if col in numeric_cols:
+                keep_objectives.append(obj)
+                continue
+            if col in cat_choices:
+                # A knob classified categorical (e.g. temperature left as text
+                # strings when the sheet mixed numbers with "Missing") can
+                # still be a numeric objective if its choices parse as numbers
+                # — same reasoning as the numeric-comparison constraint fix.
+                choices = cat_choices[col]
+                numeric_choices = 0
+                for ch in choices:
+                    try:
+                        float(ch)
+                        numeric_choices += 1
+                    except (TypeError, ValueError):
+                        pass
+                if choices and numeric_choices / len(choices) >= 0.7:
+                    keep_objectives.append(obj)
+                else:
+                    objective_notes.append(
+                        f"Objective '{col}' names a non-numeric categorical knob "
+                        "(e.g. a reagent or atmosphere choice) — only numeric "
+                        "objectives are supported. Skipped.")
+                continue
+            if col not in df.columns:
+                objective_notes.append(f"Objective '{col}' was not found in the data — skipped.")
+                continue
+            try:
+                y_obj_full = pd.to_numeric(df[col], errors="coerce")
+                mask = y_obj_full.notna().values
+                if mask.sum() < 10:
+                    objective_notes.append(
+                        f"Objective '{col}' has too few observed values ({int(mask.sum())}) "
+                        "— skipped.")
+                    continue
+                obj_model = XGBRegressor(
+                    n_estimators=400, max_depth=4, learning_rate=0.05,
+                    subsample=0.8, colsample_bytree=0.8,
+                    random_state=random_state, n_jobs=-1, verbosity=0)
+                obj_model.fit(X_enc.astype(float).values[mask], y_obj_full.values[mask])
+                extra_models[col] = obj_model
+                keep_objectives.append(obj)
+            except Exception as e:  # noqa: BLE001 - one bad objective shouldn't sink the run
+                objective_notes.append(f"Objective '{col}' failed to train ({e}) — skipped.")
+        objectives = keep_objectives
+        if len(objectives) < 2:
+            objective_notes.append("Fewer than 2 usable objectives — running single-objective.")
 
     # Base vector holds the fixed-knob contributions (never varied by the search).
     base = np.zeros(n_feat)
@@ -1005,9 +1718,15 @@ def run_capacity_optimization(data_path, target, excluded, fixed, direction,
     for c in search_numeric_cols:
         if c in fixed:
             continue
-        lo, hi = np.percentile(X_raw[c], 1), np.percentile(X_raw[c], 99)
+        if c in numeric_overrides:
+            lo, hi = numeric_overrides[c]
+        else:
+            lo, hi = np.percentile(X_raw[c], 1), np.percentile(X_raw[c], 99)
         if lo == hi:
             hi = lo + 1e-6
+        if lo > hi:      # contradictory constraints (e.g. >=1000 and <=700) -> widest safe fallback
+            lo, hi = float(np.percentile(X_raw[c], 1)), float(np.percentile(X_raw[c], 99))
+            constraint_notes.append(f"Contradictory constraints on {c} — ignored, using observed range.")
         bounds.append((lo, hi)); integrality.append(
             chemistry.descriptor_is_discrete(c))
         spec.append(("num", c, col_pos.get(c)))
@@ -1037,51 +1756,263 @@ def run_capacity_optimization(data_path, target, excluded, fixed, direction,
                 x[out] = x[left] * x[right]
         return x
 
-    def objective(vec):
-        return sign * float(model.predict(vectorize(vec).reshape(1, -1))[0])
-
-    result = differential_evolution(
-        objective, bounds, integrality=integrality, seed=random_state,
-        popsize=15, maxiter=80, tol=1e-4, mutation=(0.5, 1.0),
-        recombination=0.9, polish=False, updating="immediate")
-
-    # Decode the winning recipe (all controllable knobs, incl. fixed ones).
-    recipe = dict(fixed)
-    edges = []
-    for v, s in zip(result.x, spec):
-        if s[0] == "num":
-            recipe[s[1]] = round(float(v), 4)
-            lo, hi = np.percentile(X_raw[s[1]], 1), np.percentile(X_raw[s[1]], 99)
-            span = (hi - lo) or 1.0
-            if abs(v - lo) < 0.02 * span or abs(v - hi) < 0.02 * span:
-                edges.append(s[1])
-        else:
-            i = max(0, min(int(round(v)), len(cat_choices[s[1]]) - 1))
-            recipe[s[1]] = cat_choices[s[1]][i]
-    predicted = float(model.predict(vectorize(result.x).reshape(1, -1))[0])
+    def decode_vec(vec):
+        """One search vector -> (recipe dict incl. fixed knobs, edge-of-data flags)."""
+        recipe_ = dict(fixed)
+        edges_ = []
+        for v, s in zip(vec, spec):
+            if s[0] == "num":
+                recipe_[s[1]] = round(float(v), 4)
+                lo, hi = np.percentile(X_raw[s[1]], 1), np.percentile(X_raw[s[1]], 99)
+                span = (hi - lo) or 1.0
+                if abs(v - lo) < 0.02 * span or abs(v - hi) < 0.02 * span:
+                    edges_.append(s[1])
+            else:
+                i = max(0, min(int(round(v)), len(cat_choices[s[1]]) - 1))
+                recipe_[s[1]] = cat_choices[s[1]][i]
+        return recipe_, edges_
 
     chemistry_model_columns = set(chemistry_schema.get("interactions", []))
     for info in chemistry_schema.get("columns", {}).values():
         chemistry_model_columns.update(info.get("descriptor_columns", []))
-    ordered = [(c, recipe[c]) for c in controllable if c not in chemistry_model_columns]
-    chemical_recommendations = []
-    central = ("Is_Strong_Acid", "Is_Strong_Base", "pKa", "pKb",
-               "EstimatedOxidationTendency", "MolecularWeight", "Contains_Hydroxide")
-    for source, info in chemistry_schema.get("columns", {}).items():
-        nearest = chemistry.ENGINE.nearest_known_profile(recipe, info["prefix"], top=3)
-        if nearest:
-            ordered.append((f"Recommended {source}", nearest[0].name))
-            chemical_recommendations.append({
-                "column": source, "recommended": nearest[0].name,
-                "similarity": nearest[0].score,
-                "alternatives": [{"name": item.name, "score": item.score}
-                                 for item in nearest[1:]],
-            })
-        for key in central:
-            feature = f"{info['prefix']}_{key}"
-            if feature in recipe:
-                ordered.append((chemistry.descriptor_display_name(feature), recipe[feature]))
-    return dict(target=target, r2=cv_r2, predicted=predicted,
+
+    def annotate_recipe(recipe_dict):
+        """Ordered display list + nearest-known-reagent recommendations for one recipe."""
+        ordered_ = [(c, recipe_dict[c]) for c in controllable
+                   if c not in chemistry_model_columns]
+        chem_recs_ = []
+        central = ("Is_Strong_Acid", "Is_Strong_Base", "pKa", "pKb",
+                  "EstimatedOxidationTendency", "MolecularWeight", "Contains_Hydroxide")
+        for source, info in chemistry_schema.get("columns", {}).items():
+            nearest = chemistry.ENGINE.nearest_known_profile(recipe_dict, info["prefix"], top=3)
+            if nearest:
+                ordered_.append((f"Recommended {source}", nearest[0].name))
+                chem_recs_.append({
+                    "column": source, "recommended": nearest[0].name,
+                    "similarity": nearest[0].score,
+                    "alternatives": [{"name": item.name, "score": item.score}
+                                     for item in nearest[1:]],
+                })
+            for key in central:
+                feature = f"{info['prefix']}_{key}"
+                if feature in recipe_dict:
+                    ordered_.append((chemistry.descriptor_display_name(feature),
+                                     recipe_dict[feature]))
+        return ordered_, chem_recs_
+
+    # BAYESIAN OPTIMIZATION path: the whole feature space (search bounds,
+    # chemistry descriptors, constraints, encode/decode) is now built exactly as
+    # the differential-evolution optimizer uses it. Fit a GP surrogate over it
+    # and propose the next experiments. run_de=False returns here without the DE
+    # search / Top-N / Pareto passes, so the "Suggest Experiments" tab is fast.
+    if bayesopt_mode:
+        bo_result = _run_bo_proposals(
+            X_enc=X_enc, y=y, spec=spec, bounds=bounds, integrality=integrality,
+            vectorize=vectorize, decode_vec=decode_vec,
+            annotate_recipe=annotate_recipe, direction=direction, target=target,
+            cv_r2=cv_r2, cv_rmse=cv_rmse, label_map=label_map, fixed=fixed,
+            n_rows=len(df), n_numeric=len(search_numeric_cols),
+            n_categorical=len(cat_choices), column_type_mode=column_type_mode,
+            q=bo_batch, xi=bo_xi, random_state=random_state)
+        if not run_de:
+            return bo_result
+
+    def objective(vec):
+        return sign * float(model.predict(vectorize(vec).reshape(1, -1))[0])
+
+    de_kwargs = dict(
+        integrality=integrality, popsize=15, maxiter=80, tol=1e-4,
+        mutation=(0.5, 1.0), recombination=0.9, polish=False, updating="immediate")
+
+    # Search generation-by-generation (instead of the one-shot functional API)
+    # so every candidate DE visits along the way can be archived, not just the
+    # final, tightly-converged population. This is what makes the Top-N
+    # diversity pass below meaningful: by convergence DE's population has
+    # narrowed to near-duplicates of the single best point.
+    best_vec, archive_vecs, archive_obj = _search_with_archive(
+        objective, bounds, random_state, de_kwargs)
+
+    # Also seed the Top-N candidate pool with real training recipes (what
+    # does the fitted model predict for experiments actually run?). A free
+    # search that varies every knob independently will almost always land on
+    # combinations that read as "novel" from curse-of-dimensionality alone —
+    # ~800 rows cannot densely cover a 20-30 dimensional space — even when
+    # every individual knob value stays well inside the observed range. Real
+    # recipes score high applicability by construction, so this is what
+    # actually gives the applicability-gated ranking below trustworthy,
+    # non-extrapolated options to choose from, not just DE's exploration.
+    n_priority_candidates = 0
+    if archive_vecs and spec:
+        try:
+            sample_idx = X_raw.index
+            if len(sample_idx) > 500:
+                rng_np = np.random.RandomState(random_state)
+                sample_idx = pd.Index(rng_np.choice(sample_idx, 500, replace=False))
+            train_vecs = []
+            for ridx in sample_idx:
+                row = X_raw.loc[ridx]
+                v = []
+                for s in spec:
+                    if s[0] == "num":
+                        v.append(float(row[s[1]]))
+                    else:
+                        choices = cat_choices[s[1]]
+                        val = row[s[1]]
+                        v.append(float(choices.index(val)) if val in choices else 0.0)
+                train_vecs.append(v)
+            if train_vecs:
+                train_vecs = np.array(train_vecs, dtype=float)
+                train_obj = np.array([objective(v) for v in train_vecs])
+                archive_vecs.append(train_vecs)
+                archive_obj.append(train_obj)
+                n_priority_candidates = len(train_vecs)
+        except Exception:  # noqa: BLE001 - purely additive, never fatal
+            pass
+
+    recipe, edges = decode_vec(best_vec)
+    predicted = float(model.predict(vectorize(best_vec).reshape(1, -1))[0])
+    ordered, chemical_recommendations = annotate_recipe(recipe)
+    sensitivity = _sensitivity_analysis(best_vec, spec, vectorize, model, X_raw,
+                                        cat_choices=cat_choices)
+
+    top_recipes, n_candidates_considered = _rank_top_recipes(
+        archive_vecs, archive_obj, target=target, sign=sign, y=y, model=model,
+        vectorize=vectorize, decode_vec=decode_vec, annotate_recipe=annotate_recipe,
+        feat_cols=feat_cols, X_enc=X_enc, numeric_cols=numeric_cols,
+        cat_choices=cat_choices, X_raw=X_raw, chemistry_schema=chemistry_schema,
+        chemistry_originals_df=chemistry_originals_df, label_map=label_map,
+        cv_rmse=cv_rmse, cv_r2=cv_r2, top_n=top_n, risk_lambda=risk_lambda,
+        min_applicability=min_applicability, fixed=fixed,
+        n_priority_candidates=n_priority_candidates, random_state=random_state,
+        process_limits=process_limits)
+
+    # ---- Multi-objective Pareto front (separate search; single-best/Top-N
+    # above are always driven by the primary target alone, unaffected). ----
+    pareto_front = []
+    pareto_fronts_summary = []
+    if len(objectives) > 1:
+        try:
+            # Normalise every objective's raw value to roughly [0, 1] (min-max
+            # over its OWN observed range) before weighting, so a target
+            # spanning hundreds of mAh/g doesn't drown out one spanning a few
+            # percent. Direction is folded in here too (minimise -> flipped).
+            obj_ranges = {}
+            for obj in objectives:
+                col = obj["column"]
+                if col == target:
+                    vals = y
+                elif col in extra_models:
+                    vals = pd.to_numeric(df[col], errors="coerce").dropna().values
+                else:
+                    # Knob objective — may be a numeric column OR a numeric-
+                    # looking categorical one (values stored as strings); coerce
+                    # either way rather than taking a lexicographic min/max.
+                    vals = pd.to_numeric(X_raw[col], errors="coerce").dropna().values
+                if len(vals) == 0:
+                    raise ValueError(f"objective '{col}' has no numeric values to range over")
+                lo_r, hi_r = float(np.min(vals)), float(np.max(vals))
+                obj_ranges[col] = (lo_r, (hi_r - lo_r) or 1.0)
+
+            def objective_raw(vec, col):
+                """Raw value of one objective for a candidate, or None if this
+                candidate doesn't have a meaningful value for it — e.g. a
+                numeric-looking categorical knob objective landed on a
+                non-numeric choice like "Missing" (unrecorded data)."""
+                if col in extra_models:
+                    return float(extra_models[col].predict(vectorize(vec).reshape(1, -1))[0])
+                if col == target:
+                    return float(model.predict(vectorize(vec).reshape(1, -1))[0])
+                recipe_v, _ = decode_vec(vec)
+                try:
+                    return float(recipe_v[col])
+                except (TypeError, ValueError):
+                    return None
+
+            def multi_objective(vec):    # DE minimises -> this is "lower is better"
+                total = 0.0
+                for obj in objectives:
+                    lo_r, span_r = obj_ranges[obj["column"]]
+                    raw = objective_raw(vec, obj["column"])
+                    # No usable value for this objective on this candidate ->
+                    # worst case (1.0, post-normalisation), steering the
+                    # search away rather than crashing on it.
+                    norm = 1.0 if raw is None else (raw - lo_r) / span_r
+                    total += obj["weight"] * (norm if obj["direction"] == "minimise" else -norm)
+                return total
+
+            _, pareto_archive_vecs, pareto_archive_obj = _search_with_archive(
+                multi_objective, bounds, random_state, de_kwargs)
+
+            pareto_n_priority = 0
+            if pareto_archive_vecs and n_priority_candidates:
+                try:
+                    train_pareto_obj = np.array([multi_objective(v) for v in train_vecs])
+                    pareto_archive_vecs.append(train_vecs)
+                    pareto_archive_obj.append(train_pareto_obj)
+                    pareto_n_priority = len(train_vecs)
+                except Exception:  # noqa: BLE001
+                    pass
+
+            pareto_front, pareto_fronts_summary = _pareto_front_candidates(
+                pareto_archive_vecs, pareto_archive_obj, objectives=objectives,
+                target=target, model=model, y=y, extra_models=extra_models,
+                vectorize=vectorize, decode_vec=decode_vec, annotate_recipe=annotate_recipe,
+                feat_cols=feat_cols, X_enc=X_enc, numeric_cols=numeric_cols,
+                cat_choices=cat_choices, X_raw=X_raw, chemistry_schema=chemistry_schema,
+                chemistry_originals_df=chemistry_originals_df, label_map=label_map,
+                cv_rmse=cv_rmse, cv_r2=cv_r2, min_applicability=min_applicability,
+                fixed=fixed, n_priority_candidates=pareto_n_priority,
+                random_state=random_state, process_limits=process_limits)
+        except Exception as e:  # noqa: BLE001 - Pareto is additive, never fatal
+            objective_notes.append(f"Pareto front computation failed: {e}")
+
+    # ---- Decision-support enrichment: strategy labels, active-learning
+    # score, feasibility, reagent cost/hazard (whatever's entered), a
+    # Green Score sustainability heuristic, a balanced portfolio, a
+    # Pareto-front tradeoff explanation, and training-data coverage gaps.
+    # All best-effort over data already computed above — never able to
+    # affect the search or the single-best/Top-N/Pareto results themselves.
+    try:
+        top_recipes = planner.enrich_candidates(top_recipes) if top_recipes else top_recipes
+        for cand in top_recipes:
+            cand["reagents"] = _reagent_info_for_candidate(cand)
+            cand["sustainability"] = _sustainability_for_candidate(cand, X_raw, numeric_cols)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        if pareto_front:
+            pareto_front = planner.enrich_candidates(pareto_front)
+            for cand in pareto_front:
+                cand["reagents"] = _reagent_info_for_candidate(cand)
+                cand["sustainability"] = _sustainability_for_candidate(cand, X_raw, numeric_cols)
+            pareto_front = tradeoffs.explain(pareto_front, objectives)
+    except Exception:  # noqa: BLE001
+        pass
+    batch_plan, batch_plan_summary = [], {}
+    try:
+        if top_recipes:
+            batch_plan = portfolio.build_portfolio(top_recipes, size=min(10, top_n))
+            batch_plan_summary = portfolio.summarize(batch_plan)
+    except Exception:  # noqa: BLE001
+        pass
+    research_gaps = []
+    try:
+        research_gaps = research_gap.detect_gaps(X_raw, numeric_cols, cat_choices)
+        # research_gap.py is generic and knows nothing about this app's
+        # parsed-messy-column display labels — relabel here so a gap on
+        # e.g. 'group_label_B4' reads as "Pretreat 2: code" instead.
+        def relabel(col):
+            return screening._pretty(label_map.get(col, col))
+        for g in research_gaps:
+            for key in ("column", "column_a", "column_b"):
+                if key in g:
+                    pretty_col = relabel(g[key])
+                    g["description"] = g["description"].replace(g[key], pretty_col)
+                    g[key] = pretty_col
+    except Exception:  # noqa: BLE001
+        pass
+
+    return dict(target=target, r2=cv_r2, rmse=cv_rmse, predicted=predicted,
                 obs_min=float(y.min()), obs_max=float(y.max()),
                 recipe=ordered, fixed=set(fixed), edges=edges,
                 labels=label_map,
@@ -1090,7 +2021,15 @@ def run_capacity_optimization(data_path, target, excluded, fixed, direction,
                 n_numeric=len(search_numeric_cols), n_categorical=len(cat_choices),
                 chemistry_schema=chemistry_schema,
                 chemical_recommendations=chemical_recommendations,
-                optimized_over="chemistry descriptors, mapped back to known reagents")
+                optimized_over="chemistry descriptors, mapped back to known reagents",
+                top_recipes=top_recipes, n_candidates_considered=n_candidates_considered,
+                risk_lambda=risk_lambda, min_applicability=min_applicability,
+                constraint_notes=constraint_notes,
+                pareto_front=pareto_front, objectives_used=objectives,
+                pareto_fronts_summary=pareto_fronts_summary,
+                objective_notes=objective_notes, sensitivity=sensitivity,
+                batch_plan=batch_plan, batch_plan_summary=batch_plan_summary,
+                research_gaps=research_gaps)
 
 
 # =============================================================================
@@ -1235,6 +2174,34 @@ class AppState:
         self.opt_status = "Pick a file (Train tab), set the target/exclusions, then run."
         self.opt_error = ""
         self.opt_result = None
+
+        # Top-N recommended-experiments pass (uncertainty- and applicability-
+        # aware ranking alongside the single best recipe above).
+        self.opt_top_n = 10                # how many diverse candidates to return
+        self.opt_risk_lambda = 1.0         # penalises both prediction uncertainty
+                                           # and distance from the training domain
+        self.opt_min_applicability = 60.0  # reject candidates below this in-domain score (0-100)
+
+        # Laboratory constraints and multi-objective Pareto front (Phase 2).
+        self.opt_constraints = ""          # one 'Column <= value' etc. per line
+        self.opt_objectives = ""           # 'Column:maximize|minimize:weight, ...'
+
+        # Pareto trade-off chart: which two objectives to plot.
+        self.opt_pareto_chart_a = 0
+        self.opt_pareto_chart_b = 1
+
+        # --- Suggest Experiments tab (Bayesian optimization) ---
+        # Reuses the Optimize tab's target / direction / constraints / column
+        # roles; only the batch size and exploration weight are BO-specific.
+        self.bo_batch = 5                  # how many experiments to propose
+        self.bo_xi = 0.01                  # EI exploration margin (higher = bolder)
+        self.is_bayesopt = False
+        self.bo_status = ("Set the target + knobs (shared with the Optimize tab), "
+                          "then suggest experiments.")
+        self.bo_error = ""
+        self.bo_result = None
+        self.opt_pareto_chart_path = None
+        self.opt_pareto_chart_error = ""
 
         # --- Charts tab ---
         self.charts_target_idx = 0         # target for SHAP + optimization heatmap
@@ -2081,6 +3048,11 @@ def start_optimize():
         chemistry_schema=STATE.chemistry_schema,
         chemistry_mode=["off", "automatic", "compact", "standard", "full", "custom"][
             min(STATE.chemistry_mode_idx, 5)],
+        top_n=STATE.opt_top_n,
+        risk_lambda=STATE.opt_risk_lambda,
+        min_applicability=STATE.opt_min_applicability,
+        constraints_text=STATE.opt_constraints,
+        objectives_text=STATE.opt_objectives,
     )
     threading.Thread(target=_optimize_worker, args=(cfg,), daemon=True).start()
 
@@ -2095,19 +3067,108 @@ def _optimize_worker(cfg):
             ids=cfg.get("ids"), mixed=cfg.get("mixed"),
             chemistry_enabled=cfg.get("chemistry_enabled", True),
             chemistry_schema=cfg.get("chemistry_schema"),
-            chemistry_mode=cfg.get("chemistry_mode", "automatic"))
+            chemistry_mode=cfg.get("chemistry_mode", "automatic"),
+            top_n=cfg.get("top_n", 10), risk_lambda=cfg.get("risk_lambda", 1.0),
+            min_applicability=cfg.get("min_applicability", 60.0),
+            constraints_text=cfg.get("constraints_text", ""),
+            objectives_text=cfg.get("objectives_text", ""))
         STATE.opt_result = res
         src = ("column-type roles" if res.get("mode") == "column-type"
                else "manual exclusions")
+        n_top = len(res.get("top_recipes", []))
+        n_pareto = len(res.get("pareto_front", []))
+        pareto_bit = f", {n_pareto} Pareto-optimal trade-off(s)" if len(
+            res.get("objectives_used", [])) > 1 else ""
         STATE.opt_status = (
             f"Done ({src}). Model R²={res['r2']:.2f} on {res['n_rows']} rows, "
             f"{res['n_knobs']} knobs "
-            f"({res.get('n_numeric', 0)} numeric / {res.get('n_categorical', 0)} categorical).")
+            f"({res.get('n_numeric', 0)} numeric / {res.get('n_categorical', 0)} categorical). "
+            f"{n_top} recommended experiment(s) from "
+            f"{res.get('n_candidates_considered', 0)} candidates considered{pareto_bit}.")
     except Exception as e:  # noqa: BLE001
         STATE.opt_error = f"{type(e).__name__}: {e}"
         STATE.opt_status = "Optimization failed."
     finally:
         STATE.is_optimizing = False
+
+
+def start_bayesopt():
+    """Kick off Bayesian-optimization experiment suggestion on a background
+    thread. Shares the Optimize tab's target / direction / constraints / column
+    roles — only the surrogate (GP) and selection (Expected Improvement) differ."""
+    if STATE.is_bayesopt or not STATE.data_path:
+        return
+    STATE.is_bayesopt = True
+    STATE.bo_error = ""
+    STATE.bo_result = None
+    STATE.bo_status = "Fitting Gaussian-process surrogate…"
+
+    features = col_types = ids = mixed = None
+    excluded = _split_cols(STATE.opt_excluded)
+    if STATE.coltype_columns:
+        sync_roles_to_cfg()
+        features = [c for c in STATE.coltype_columns
+                    if STATE.coltype_role.get(c) == "feature"]
+        ids = [c for c in STATE.coltype_columns
+               if STATE.coltype_role.get(c) == "id"]
+        mixed = [c for c in STATE.coltype_columns
+                 if STATE.coltype_role.get(c) == "messy"]
+        excluded = [c for c in STATE.coltype_columns
+                    if STATE.coltype_role.get(c) == "exclude"]
+        col_types = dict(STATE.coltype_map)
+    else:
+        ids = _split_cols(STATE.id_columns)
+        mixed = _split_cols(STATE.mixed_column)
+
+    cfg = dict(
+        data_path=STATE.data_path,
+        target=STATE.opt_target.strip(),
+        excluded=excluded,
+        fixed=_parse_fixed(STATE.opt_fixed),
+        direction="maximise" if STATE.opt_direction_idx == 0 else "minimise",
+        sheet=_current_sheet(),
+        features=features,
+        col_types=col_types,
+        ids=ids,
+        mixed=mixed,
+        chemistry_enabled=STATE.chemistry_enabled,
+        chemistry_schema=STATE.chemistry_schema,
+        chemistry_mode=["off", "automatic", "compact", "standard", "full", "custom"][
+            min(STATE.chemistry_mode_idx, 5)],
+        constraints_text=STATE.opt_constraints,
+        bo_batch=int(STATE.bo_batch),
+        bo_xi=float(STATE.bo_xi),
+    )
+    threading.Thread(target=_bayesopt_worker, args=(cfg,), daemon=True).start()
+
+
+def _bayesopt_worker(cfg):
+    try:
+        STATE.bo_status = "Fitting GP surrogate + maximizing acquisition…"
+        res = run_capacity_optimization(
+            cfg["data_path"], cfg["target"], cfg["excluded"],
+            cfg["fixed"], cfg["direction"], sheet=cfg.get("sheet"),
+            features=cfg.get("features"), col_types=cfg.get("col_types"),
+            ids=cfg.get("ids"), mixed=cfg.get("mixed"),
+            chemistry_enabled=cfg.get("chemistry_enabled", True),
+            chemistry_schema=cfg.get("chemistry_schema"),
+            chemistry_mode=cfg.get("chemistry_mode", "automatic"),
+            constraints_text=cfg.get("constraints_text", ""),
+            bayesopt_mode=True, run_de=False,
+            bo_batch=cfg.get("bo_batch", 5), bo_xi=cfg.get("bo_xi", 0.01))
+        STATE.bo_result = res
+        src = ("column-type roles" if res.get("mode") == "column-type"
+               else "manual exclusions")
+        STATE.bo_status = (
+            f"Done ({src}). GP surrogate on {res['n_rows']} rows, "
+            f"{res['n_knobs']} knobs "
+            f"({res.get('n_numeric', 0)} numeric / {res.get('n_categorical', 0)} "
+            f"categorical). {len(res.get('proposals', []))} experiment(s) proposed.")
+    except Exception as e:  # noqa: BLE001
+        STATE.bo_error = f"{type(e).__name__}: {e}"
+        STATE.bo_status = "Suggestion failed."
+    finally:
+        STATE.is_bayesopt = False
 
 
 # =============================================================================
@@ -3859,6 +4920,64 @@ def draw_optimize_tab():
     imgui.set_next_item_width(360)
     _, STATE.opt_fixed = imgui.input_text("Fixed knobs (name=value, comma-sep)", STATE.opt_fixed)
 
+    if imgui.collapsing_header("Laboratory constraints"):
+        imgui.text_wrapped(
+            "One per line: Column <= value, Column >= value, Column == value, "
+            "Column != value, Column IN [a, b, c], Column NOT IN [a, b, c]. "
+            "Eliminates invalid candidates from the search itself.")
+        imgui.text_wrapped(
+            "Shortcuts — chemical class: 'NO STRONG ACID' / 'NO STRONG BASE' / "
+            "'NO OXIDIZER' / 'NO REDUCING AGENT' / 'NO CHLORIDE' / 'NO FLUORIDE' / "
+            "'NO SULFATE' (excludes that class from every chemistry role in use). "
+            "Process: 'stages <= N' / 'steps <= N' (caps pyrolysis stages / optional "
+            "processing steps in the recommended recipes).")
+        _, STATE.opt_constraints = imgui.input_text_multiline(
+            "##opt_constraints", STATE.opt_constraints, imgui.ImVec2(-1, 80))
+        r = STATE.opt_result
+        if r and r.get("constraint_notes"):
+            for note in r["constraint_notes"]:
+                imgui.text_colored(DIM, "• " + note)
+
+    if imgui.collapsing_header("Multiple objectives (Pareto front)"):
+        imgui.text_wrapped(
+            "Optional: 'Column:maximize|minimize:weight' entries, comma- or "
+            "newline-separated, e.g. 'LIB_1A:maximize:0.6, Py.2 temp. "
+            "(oC):minimize:0.4'. Weights auto-normalise. When set, a SEPARATE "
+            "search also runs for these objectives together and returns "
+            "non-dominated trade-off recipes below — the single best recipe "
+            "and Top-N list above always stay driven by the primary target alone.")
+        _, STATE.opt_objectives = imgui.input_text_multiline(
+            "##opt_objectives", STATE.opt_objectives, imgui.ImVec2(-1, 60))
+        r = STATE.opt_result
+        if r and r.get("objective_notes"):
+            for note in r["objective_notes"]:
+                imgui.text_colored((0.9, 0.7, 0.2, 1.0), "• " + note)
+
+    if imgui.collapsing_header("Recommended-experiments settings (Top-N)",
+                               imgui.TreeNodeFlags_.default_open):
+        imgui.text_wrapped(
+            "Beyond the single best recipe below, also ranks a diverse set of "
+            "in-domain alternatives — each scored for predicted value, "
+            "uncertainty, and similarity to real training experiments.")
+        imgui.set_next_item_width(200)
+        changed, v = imgui.input_int("How many to recommend", int(STATE.opt_top_n))
+        if changed:
+            STATE.opt_top_n = max(1, v)
+        imgui.set_next_item_width(200)
+        changed, v = imgui.slider_float(
+            "Risk penalty (uncertainty + extrapolation)", float(STATE.opt_risk_lambda), 0.0, 3.0)
+        if changed:
+            STATE.opt_risk_lambda = v
+        imgui.set_next_item_width(200)
+        changed, v = imgui.slider_float(
+            "Minimum applicability %", float(STATE.opt_min_applicability), 0.0, 100.0)
+        if changed:
+            STATE.opt_min_applicability = v
+        imgui.text_colored(
+            DIM, "Applicability compares a candidate to real training experiments; "
+                "with many independent knobs, absolute values run low even for "
+                "reasonable recipes — the ranking (not the raw %) is what matters.")
+
     # The manual exclusion list is only used as a fallback (no roles configured).
     if not has_roles:
         imgui.text_colored(DIM, "Excluded (measured / outcome) columns — one big list:")
@@ -3943,6 +5062,330 @@ def draw_optimize_tab():
                     imgui.text_wrapped(alternatives)
                 imgui.end_table()
 
+        top_recipes = r.get("top_recipes") or []
+        if top_recipes:
+            imgui.dummy(imgui.ImVec2(0, 8))
+            imgui.separator()
+            imgui.text(f"Recommended experiments (top {len(top_recipes)} of "
+                      f"{r.get('n_candidates_considered', 0)} candidates considered)")
+            imgui.text_colored(
+                DIM, "Diverse, in-domain alternatives to the single best recipe above — "
+                    "hover a row for the full reasoning. Risk/Applicability come from "
+                    "similarity to real training experiments, not just the raw prediction.")
+            flags = (imgui.TableFlags_.borders | imgui.TableFlags_.row_bg
+                     | imgui.TableFlags_.scroll_y)
+            if imgui.begin_table("top_recipes", 9, flags, outer_size=imgui.ImVec2(0, 240)):
+                imgui.table_setup_column("#")
+                imgui.table_setup_column("Predicted")
+                imgui.table_setup_column("95% interval")
+                imgui.table_setup_column("Applicability")
+                imgui.table_setup_column("Risk")
+                imgui.table_setup_column("Similarity")
+                imgui.table_setup_column("Strategy")
+                imgui.table_setup_column("Green")
+                imgui.table_setup_column("Reason")
+                imgui.table_headers_row()
+                risk_color = {"Low": GREEN, "Moderate": (0.9, 0.7, 0.2, 1.0), "High": RED}
+                green_color = {"A": GREEN, "B": GREEN, "C": (0.9, 0.7, 0.2, 1.0),
+                              "D": (0.9, 0.7, 0.2, 1.0), "F": RED}
+                for cand in top_recipes:
+                    imgui.table_next_row()
+                    imgui.table_next_column(); imgui.text(str(cand["rank"]))
+                    imgui.table_next_column(); imgui.text(f"{cand['predicted']:.1f}")
+                    imgui.table_next_column()
+                    imgui.text(f"{cand['lo']:.0f} – {cand['hi']:.0f}")
+                    imgui.table_next_column()
+                    imgui.text(f"{cand['applicability_pct']:.0f}%")
+                    imgui.table_next_column()
+                    imgui.text_colored(risk_color.get(cand["risk"], DIM), cand["risk"])
+                    imgui.table_next_column()
+                    sim = cand.get("similarity_pct")
+                    imgui.text(f"{sim:.0f}%" if sim is not None else "-")
+                    imgui.table_next_column()
+                    imgui.text(cand.get("strategy", "-"))
+                    if imgui.is_item_hovered() and cand.get("strategy_reason"):
+                        imgui.set_tooltip(cand["strategy_reason"])
+                    imgui.table_next_column()
+                    sus = cand.get("sustainability")
+                    if sus:
+                        imgui.text_colored(green_color.get(sus["grade"], DIM),
+                                          f"{sus['grade']} ({sus['score']:.0f})")
+                        if imgui.is_item_hovered() and sus.get("deductions"):
+                            imgui.set_tooltip("\n".join(
+                                f"-{d['points']:.0f}: {d['reason']}" for d in sus["deductions"]))
+                    else:
+                        imgui.text("-")
+                    imgui.table_next_column()
+                    reason_text = " ".join(cand.get("reason", []))
+                    imgui.text_wrapped(reason_text[:70] + ("…" if len(reason_text) > 70 else ""))
+                    if imgui.is_item_hovered() and cand.get("reason"):
+                        imgui.set_tooltip("\n".join(cand["reason"]))
+                imgui.end_table()
+            if imgui.tree_node("Recommended experiments: full recipes##top_recipe_details"):
+                for cand in top_recipes:
+                    label = (f"#{cand['rank']}: {cand.get('strategy', '')} — "
+                            f"predicted {cand['predicted']:.1f}, "
+                            f"{cand['risk']} risk, {cand['applicability_pct']:.0f}% applicability"
+                            f"##top_recipe_{cand['rank']}")
+                    if imgui.tree_node(label):
+                        imgui.text_colored(DIM, cand.get("strategy_reason", ""))
+                        imgui.text(f"Feasibility: {cand.get('feasibility', 'n/a')}  |  "
+                                  f"Active-learning info gain: {cand.get('info_gain', 0):.0f}/100")
+                        for line in cand.get("reason", []):
+                            imgui.bullet_text(line)
+                        reagents = cand.get("reagents") or []
+                        if reagents:
+                            imgui.text("Reagent cost / hazard (from your entered data):")
+                            for rg in reagents:
+                                cost = (f"${rg['cost_per_kg']:g}/kg" if rg["cost_per_kg"] is not None
+                                       else (f"${rg['cost_per_liter']:g}/L"
+                                             if rg["cost_per_liter"] is not None else "cost: not entered"))
+                                haz = rg["hazard_class"]
+                                corrosive = " · corrosive" if rg["corrosive"] else ""
+                                imgui.bullet_text(f"{rg['reagent']}: {cost} · hazard: {haz}{corrosive}")
+                        sus = cand.get("sustainability")
+                        if sus:
+                            imgui.text(f"Green Score: {sus['score']:.0f}/100 (grade {sus['grade']})")
+                            for d in sus.get("deductions", []):
+                                imgui.bullet_text(f"-{d['points']:.0f}: {d['reason']}")
+                            if sus.get("unscored_reagents"):
+                                imgui.text_colored(
+                                    DIM, "No hazard data entered for: "
+                                        + ", ".join(sus["unscored_reagents"]) + " (not scored).")
+                        flags2 = imgui.TableFlags_.borders | imgui.TableFlags_.row_bg
+                        if imgui.begin_table(f"top_recipe_detail_{cand['rank']}", 2, flags2):
+                            imgui.table_setup_column("Knob")
+                            imgui.table_setup_column("Value")
+                            imgui.table_headers_row()
+                            for name, val in cand["recipe"]:
+                                shown = knob_label(name)
+                                imgui.table_next_row()
+                                imgui.table_next_column()
+                                if name in cand["fixed"]:
+                                    imgui.text_colored(DIM, shown + "  (fixed)")
+                                else:
+                                    imgui.text(shown)
+                                imgui.table_next_column()
+                                imgui.text(f"{val:g}" if isinstance(val, float) else str(val))
+                            imgui.end_table()
+                        imgui.tree_pop()
+                imgui.tree_pop()
+
+        batch_plan = r.get("batch_plan") or []
+        if batch_plan:
+            imgui.dummy(imgui.ImVec2(0, 8))
+            imgui.separator()
+            imgui.text(f"Balanced batch plan — {len(batch_plan)} experiment(s)")
+            imgui.text_colored(
+                DIM, "A portfolio to run together, not just the single best repeated — "
+                    "one bucket per experiment strategy (safe, validation, novel chemistry, "
+                    "gap-filling, high-risk-high-reward, ...).")
+            summary = r.get("batch_plan_summary") or {}
+            if summary:
+                composition = ", ".join(f"{n} {label}" for label, n in summary.items())
+                imgui.text_colored(DIM, "Composition: " + composition)
+            flags = imgui.TableFlags_.borders | imgui.TableFlags_.row_bg
+            if imgui.begin_table("batch_plan", 5, flags, outer_size=imgui.ImVec2(0, 160)):
+                imgui.table_setup_column("#")
+                imgui.table_setup_column("Predicted")
+                imgui.table_setup_column("Strategy")
+                imgui.table_setup_column("Feasibility")
+                imgui.table_setup_column("Info gain")
+                imgui.table_headers_row()
+                for cand in batch_plan:
+                    imgui.table_next_row()
+                    imgui.table_next_column(); imgui.text(str(cand["batch_rank"]))
+                    imgui.table_next_column(); imgui.text(f"{cand.get('predicted', float('nan')):.1f}")
+                    imgui.table_next_column(); imgui.text(cand.get("strategy", "-"))
+                    imgui.table_next_column(); imgui.text(cand.get("feasibility", "-"))
+                    imgui.table_next_column(); imgui.text(f"{cand.get('info_gain', 0):.0f}")
+                imgui.end_table()
+
+        research_gaps = r.get("research_gaps") or []
+        if research_gaps:
+            imgui.dummy(imgui.ImVec2(0, 8))
+            imgui.separator()
+            if imgui.collapsing_header(f"Research gaps — {len(research_gaps)} under-studied "
+                                       "area(s) in your training data"):
+                imgui.text_colored(
+                    DIM, "Regions of the dataset with little or no coverage — experiments "
+                        "here would expand what the model has actually seen, beyond just "
+                        "chasing the highest prediction.")
+                for g in research_gaps:
+                    imgui.bullet_text(g["description"])
+
+        pareto_front = r.get("pareto_front") or []
+        objectives_used = r.get("objectives_used") or []
+        fronts_summary = r.get("pareto_fronts_summary") or []
+        if pareto_front:
+            imgui.dummy(imgui.ImVec2(0, 8))
+            imgui.separator()
+            obj_summary = ", ".join(
+                f"{knob_label(o['column'])} ({o['direction']}, weight {o['weight']:.2f})"
+                for o in objectives_used)
+            imgui.text(f"Pareto front — {len(pareto_front)} non-dominated trade-off(s)")
+            imgui.text_colored(DIM, "Objectives: " + obj_summary)
+            imgui.text_colored(
+                DIM, "No single recipe wins on every objective here — each row below "
+                    "beats every other on at least one, and none beats it on all.")
+            if len(fronts_summary) > 1:
+                imgui.text_colored(
+                    DIM, f"{fronts_summary[0]} candidate(s) on the optimal front "
+                        f"(shown here, diversity-filtered to {len(pareto_front)}); "
+                        + ", ".join(f"{n} on rank-{i+2}" for i, n in enumerate(fronts_summary[1:5]))
+                        + " — close-but-not-quite trade-offs, for context.")
+            obj_cols = [o["column"] for o in objectives_used]
+            flags = (imgui.TableFlags_.borders | imgui.TableFlags_.row_bg
+                     | imgui.TableFlags_.scroll_y)
+            n_cols = 4 + len(obj_cols)
+            if imgui.begin_table("pareto", n_cols, flags, outer_size=imgui.ImVec2(0, 200)):
+                imgui.table_setup_column("#")
+                for col in obj_cols:
+                    imgui.table_setup_column(knob_label(col))
+                imgui.table_setup_column("Applicability")
+                imgui.table_setup_column("Risk")
+                imgui.table_setup_column("Green")
+                imgui.table_headers_row()
+                risk_color = {"Low": GREEN, "Moderate": (0.9, 0.7, 0.2, 1.0), "High": RED}
+                green_color = {"A": GREEN, "B": GREEN, "C": (0.9, 0.7, 0.2, 1.0),
+                              "D": (0.9, 0.7, 0.2, 1.0), "F": RED}
+                for pt in pareto_front:
+                    imgui.table_next_row()
+                    imgui.table_next_column(); imgui.text(str(pt["rank"]))
+                    for col in obj_cols:
+                        imgui.table_next_column()
+                        imgui.text(f"{pt['objectives'].get(col, float('nan')):.3g}")
+                    imgui.table_next_column()
+                    imgui.text(f"{pt['applicability_pct']:.0f}%")
+                    imgui.table_next_column()
+                    imgui.text_colored(risk_color.get(pt["risk"], DIM), pt["risk"])
+                    imgui.table_next_column()
+                    sus = pt.get("sustainability")
+                    if sus:
+                        imgui.text_colored(green_color.get(sus["grade"], DIM),
+                                          f"{sus['grade']} ({sus['score']:.0f})")
+                    else:
+                        imgui.text("-")
+                imgui.end_table()
+            if imgui.tree_node("Pareto front: trade-offs and full recipes##pareto_details"):
+                for pt in pareto_front:
+                    obj_bits = ", ".join(f"{knob_label(c)}={v:.3g}"
+                                         for c, v in pt["objectives"].items())
+                    label = f"#{pt['rank']}: {obj_bits}##pareto_recipe_{pt['rank']}"
+                    if imgui.tree_node(label):
+                        if pt.get("advantages"):
+                            imgui.text_colored(GREEN, "Advantages:")
+                            for a in pt["advantages"]:
+                                imgui.bullet_text(a)
+                        if pt.get("disadvantages"):
+                            imgui.text_colored((0.9, 0.7, 0.2, 1.0), "Disadvantages:")
+                            for d in pt["disadvantages"]:
+                                imgui.bullet_text(d)
+                        if pt.get("tradeoff"):
+                            imgui.text_wrapped("Trade-off: " + pt["tradeoff"])
+                        if pt.get("crowding") is not None:
+                            imgui.text_colored(
+                                DIM, f"Uniqueness within this front: {pt['crowding']:.2f} "
+                                    "(higher = more distinct trade-off, less redundant with "
+                                    "its neighbours)")
+                        sus = pt.get("sustainability")
+                        if sus:
+                            imgui.text(f"Green Score: {sus['score']:.0f}/100 (grade {sus['grade']})")
+                            for d in sus.get("deductions", []):
+                                imgui.bullet_text(f"-{d['points']:.0f}: {d['reason']}")
+                        flags2 = imgui.TableFlags_.borders | imgui.TableFlags_.row_bg
+                        if imgui.begin_table(f"pareto_detail_{pt['rank']}", 2, flags2):
+                            imgui.table_setup_column("Knob")
+                            imgui.table_setup_column("Value")
+                            imgui.table_headers_row()
+                            for name, val in pt["recipe"]:
+                                shown = knob_label(name)
+                                imgui.table_next_row()
+                                imgui.table_next_column()
+                                if name in pt["fixed"]:
+                                    imgui.text_colored(DIM, shown + "  (fixed)")
+                                else:
+                                    imgui.text(shown)
+                                imgui.table_next_column()
+                                imgui.text(f"{val:g}" if isinstance(val, float) else str(val))
+                            imgui.end_table()
+                        imgui.tree_pop()
+                imgui.tree_pop()
+
+            if len(obj_cols) >= 2:
+                imgui.dummy(imgui.ImVec2(0, 6))
+                if imgui.tree_node("Pareto trade-off chart##pareto_chart"):
+                    obj_labels = [knob_label(c) for c in obj_cols]
+                    imgui.set_next_item_width(220)
+                    changed, ia = imgui.combo(
+                        "X axis", min(STATE.opt_pareto_chart_a, len(obj_cols) - 1), obj_labels)
+                    if changed:
+                        STATE.opt_pareto_chart_a = ia
+                    imgui.set_next_item_width(220)
+                    changed, ib = imgui.combo(
+                        "Y axis", min(STATE.opt_pareto_chart_b, len(obj_cols) - 1), obj_labels)
+                    if changed:
+                        STATE.opt_pareto_chart_b = ib
+                    if imgui.button("Generate chart"):
+                        _generate_pareto_chart(pareto_front, objectives_used,
+                                              STATE.opt_pareto_chart_a, STATE.opt_pareto_chart_b)
+                    if STATE.opt_pareto_chart_error:
+                        imgui.text_colored(RED, STATE.opt_pareto_chart_error)
+                    if STATE.opt_pareto_chart_path:
+                        _show_chart_image(STATE.opt_pareto_chart_path)
+                    imgui.tree_pop()
+        elif len(objectives_used) > 1:
+            imgui.dummy(imgui.ImVec2(0, 8))
+            imgui.text_colored(
+                (0.9, 0.7, 0.2, 1.0),
+                "No Pareto-optimal candidates survived the applicability gate — "
+                "try lowering 'Minimum applicability %' above.")
+
+        sensitivity = r.get("sensitivity") or []
+        if sensitivity:
+            imgui.dummy(imgui.ImVec2(0, 8))
+            imgui.separator()
+            imgui.text("Robustness — sensitivity of the best recipe to small changes")
+            imgui.text_colored(
+                DIM, "Each knob is swept a little either side of its recommended value, "
+                    "holding everything else fixed, to show whether the prediction is "
+                    "stable or needs unrealistic precision.")
+            for s in sensitivity:
+                tag_color = GREEN if s["robust"] else (0.9, 0.7, 0.2, 1.0)
+                tag = "robust" if s["robust"] else "sensitive"
+                imgui.text_colored(
+                    tag_color,
+                    f"{knob_label(s['knob'])}: {tag} — predicted {r['target']} varies "
+                    f"{s['pct_range']:.1f}% across the sweep")
+                sweep_text = "  ".join(f"{v:g}→{p:.0f}" for v, p in s["sweep"])
+                imgui.text_colored(DIM, "    " + sweep_text)
+
+
+def _generate_pareto_chart(pareto_front, objectives_used, idx_a, idx_b):
+    """Render a 2D Pareto scatter for any pair of objectives from an
+    already-computed Pareto front, reusing charts.py's existing
+    pareto_front() chart maker (the same one the multi-target Charts tab
+    uses) rather than duplicating plotting code."""
+    STATE.opt_pareto_chart_error = ""
+    STATE.opt_pareto_chart_path = None
+    try:
+        import charts as C
+        obj_cols = [o["column"] for o in objectives_used]
+        if idx_a >= len(obj_cols) or idx_b >= len(obj_cols):
+            raise ValueError("axis selection out of range")
+        col_a, col_b = obj_cols[idx_a], obj_cols[idx_b]
+        dir_a = objectives_used[idx_a]["direction"]
+        dir_b = objectives_used[idx_b]["direction"]
+        df = pd.DataFrame([pt["objectives"] for pt in pareto_front])
+        os.makedirs(CHART_DIR, exist_ok=True)
+        STATE.charts_run += 1
+        out = f"{CHART_DIR}/pareto_optimizer_{STATE.charts_run}.png"
+        C.pareto_front(df, col_a, col_b, out, maximize_a=(dir_a == "maximise"),
+                       maximize_b=(dir_b == "maximise"), title=f"{col_a} vs {col_b}")
+        STATE.opt_pareto_chart_path = out
+    except Exception as e:  # noqa: BLE001
+        STATE.opt_pareto_chart_error = f"Chart generation failed: {e}"
+
 
 def _show_chart_image(rel_path):
     """Display a generated PNG in-window, scaled to the panel; fall back to a
@@ -3990,6 +5433,140 @@ def _show_chart_image(rel_path):
             os.startfile(abs_path)  # Windows
         except Exception:  # noqa: BLE001
             pass
+
+
+def draw_bayesopt_tab():
+    imgui.text("Suggest Experiments — automated Bayesian optimization")
+    imgui.text_colored(
+        DIM,
+        "Fits a Gaussian-process surrogate that models both the predicted "
+        "outcome and its own uncertainty, then proposes the next experiments to "
+        "run by maximizing Expected Improvement — the experiments most likely to "
+        "beat your current best. Ideal for planning the next round in the lab.")
+    imgui.separator()
+
+    if not STATE.data_path:
+        imgui.text_colored(DIM, "Choose a spreadsheet in the Train tab first.")
+        return
+    imgui.text_colored(DIM, STATE.data_path)
+
+    role = STATE.coltype_role
+    has_roles = bool(STATE.coltype_columns)
+    tgts = [c for c in STATE.coltype_columns
+            if role.get(c) == "target"] if has_roles else []
+    feats = [c for c in STATE.coltype_columns
+             if role.get(c) == "feature"] if has_roles else []
+
+    if has_roles:
+        imgui.text_colored(GREEN, f"Using Column-types roles: {len(feats)} knob(s). "
+                           "Constraints & fixed knobs are shared with the Optimize tab.")
+        if tgts:
+            if STATE.opt_target not in tgts:
+                STATE.opt_target = tgts[0]
+            ti = tgts.index(STATE.opt_target)
+            imgui.set_next_item_width(360)
+            changed, ti = imgui.combo("Target to optimise", ti, tgts)
+            if changed:
+                STATE.opt_target = tgts[ti]
+        else:
+            imgui.set_next_item_width(360)
+            _, STATE.opt_target = imgui.input_text("Target to optimise", STATE.opt_target)
+    else:
+        imgui.text_colored(ORANGE, "No Column-types roles set — using the Optimize "
+                           "tab's manual exclusion list and target.")
+        imgui.set_next_item_width(360)
+        _, STATE.opt_target = imgui.input_text("Target to optimise", STATE.opt_target)
+
+    imgui.set_next_item_width(360)
+    _, STATE.opt_direction_idx = imgui.combo("Direction", STATE.opt_direction_idx,
+                                             ["maximise", "minimise"])
+    imgui.set_next_item_width(200)
+    changed, v = imgui.input_int("Experiments to propose", int(STATE.bo_batch))
+    if changed:
+        STATE.bo_batch = max(1, min(v, 20))
+    imgui.set_next_item_width(200)
+    changed, v = imgui.slider_float("Exploration (EI margin)", float(STATE.bo_xi),
+                                    0.0, 0.5)
+    if changed:
+        STATE.bo_xi = v
+    imgui.same_line()
+    imgui.text_colored(DIM, "higher = bolder, more exploratory picks")
+
+    if imgui.button("Suggest experiments", size=imgui.ImVec2(220, 0)):
+        start_bayesopt()
+    imgui.same_line()
+    imgui.text_colored(DIM, "Shares target / constraints / fixed knobs with the "
+                       "Optimize tab.")
+    imgui.text_colored(RED if STATE.bo_error else DIM, STATE.bo_status)
+    if STATE.bo_error:
+        imgui.text_wrapped(STATE.bo_error)
+
+    r = STATE.bo_result
+    if r is None:
+        return
+    labels = r.get("labels", {})
+
+    def knob_label(name):
+        return labels.get(name, name)
+
+    imgui.separator()
+    unit_dir = "maximise" if r["direction"] == "maximise" else "minimise"
+    imgui.text_colored(GREEN,
+                       f"{len(r['proposals'])} experiment(s) proposed to {unit_dir} "
+                       f"{r['target']}.")
+    imgui.text_colored(DIM, f"Best observed so far: {r['y_best']:.0f}   "
+                       f"(range {r['obs_min']:.0f}–{r['obs_max']:.0f}). "
+                       f"Surrogate cross-check R² = {r['r2']:.2f}.")
+    for note in r.get("notes", []):
+        imgui.text_colored(ORANGE, "• " + note)
+
+    for p in r["proposals"]:
+        header = (f"#{p['rank']}   predicted {p['predicted']:.0f} "
+                  f"± {p['sigma']:.0f}    Expected Improvement {p['ei']:.2f}"
+                  f"##bo{p['rank']}")
+        flags = (imgui.TreeNodeFlags_.default_open if p["rank"] == 1 else 0)
+        if imgui.collapsing_header(header, flags):
+            imgui.text_colored(
+                DIM, f"95% predictive interval: {p['lo']:.0f} – {p['hi']:.0f} "
+                     f"{r['target']}.")
+            if p["edges"]:
+                imgui.text_colored(ORANGE, "Extrapolation risk (knob at edge of "
+                                   "data): " + ", ".join(knob_label(e)
+                                                         for e in p["edges"]))
+            tflags = imgui.TableFlags_.borders | imgui.TableFlags_.row_bg
+            if imgui.begin_table(f"bo_recipe_{p['rank']}", 2, tflags,
+                                 outer_size=imgui.ImVec2(0, 300)):
+                imgui.table_setup_column("Knob")
+                imgui.table_setup_column("Value")
+                imgui.table_headers_row()
+                for name, val in p["recipe"]:
+                    imgui.table_next_row()
+                    imgui.table_next_column()
+                    if name in p["fixed"]:
+                        imgui.text_colored(DIM, knob_label(name) + "  (fixed)")
+                    else:
+                        imgui.text(knob_label(name))
+                    imgui.table_next_column()
+                    imgui.text(f"{val:g}" if isinstance(val, float) else str(val))
+                imgui.end_table()
+            if p.get("chemical_recommendations"):
+                imgui.text_colored(DIM, "Closest known reagents (search runs on "
+                                   "descriptors):")
+                cflags = imgui.TableFlags_.borders | imgui.TableFlags_.row_bg
+                if imgui.begin_table(f"bo_chem_{p['rank']}", 3, cflags):
+                    imgui.table_setup_column("Input")
+                    imgui.table_setup_column("Recommended")
+                    imgui.table_setup_column("Profile match")
+                    imgui.table_headers_row()
+                    for item in p["chemical_recommendations"]:
+                        imgui.table_next_row()
+                        imgui.table_next_column()
+                        imgui.text(str(item["column"]))
+                        imgui.table_next_column()
+                        imgui.text(str(item["recommended"]))
+                        imgui.table_next_column()
+                        imgui.text(f"{item['similarity']:.2f}")
+                    imgui.end_table()
 
 
 def draw_charts_tab():
@@ -4888,6 +6465,65 @@ def draw_chemical_knowledge_tab():
             imgui.table_next_column(); imgui.text(f"{descriptor.confidence:.2f}")
         imgui.end_table()
 
+    if imgui.collapsing_header("Reagent cost & hazard (your own data, optional)"):
+        imgui.text_wrapped(
+            "Nothing here is guessed — enter real prices/hazard ratings from your own "
+            "supplier sheets or MSDS data if you want the Optimize tab to show cost and "
+            "hazard information for recommended experiments. Left blank = 'not entered', "
+            "shown honestly as such rather than defaulted to zero or 'safe'. Saved to "
+            f"'{cost_model.ENGINE.path}'.")
+        flags = imgui.TableFlags_.borders | imgui.TableFlags_.row_bg
+        if imgui.begin_table("cost_hazard", 5, flags, outer_size=imgui.ImVec2(0, 180)):
+            imgui.table_setup_column("Chemical")
+            imgui.table_setup_column("$ / kg")
+            imgui.table_setup_column("$ / L")
+            imgui.table_setup_column("Hazard class")
+            imgui.table_setup_column("Corrosive")
+            imgui.table_headers_row()
+            any_dirty = False
+            for item in STATE.chemical_knowledge:
+                name = item["descriptor"].canonical_name
+                entry = cost_model.ENGINE.get(name) or cost_model.ReagentCostEntry(name=name)
+                row_dirty = False
+                imgui.table_next_row()
+                imgui.table_next_column(); imgui.text(name)
+                imgui.table_next_column()
+                imgui.set_next_item_width(-1)
+                changed, v = imgui.input_float(
+                    f"##cost_kg_{name}", entry.cost_per_kg or 0.0, format="%.2f")
+                if changed:
+                    entry.cost_per_kg = v if v > 0 else None
+                    row_dirty = True
+                imgui.table_next_column()
+                imgui.set_next_item_width(-1)
+                changed, v = imgui.input_float(
+                    f"##cost_l_{name}", entry.cost_per_liter or 0.0, format="%.2f")
+                if changed:
+                    entry.cost_per_liter = v if v > 0 else None
+                    row_dirty = True
+                imgui.table_next_column()
+                imgui.set_next_item_width(-1)
+                idx = (cost_model.HAZARD_LEVELS.index(entry.hazard_class)
+                      if entry.hazard_class in cost_model.HAZARD_LEVELS else 0)
+                changed, idx = imgui.combo(f"##hazard_{name}", idx, cost_model.HAZARD_LEVELS)
+                if changed:
+                    entry.hazard_class = cost_model.HAZARD_LEVELS[idx]
+                    row_dirty = True
+                imgui.table_next_column()
+                changed, v = imgui.checkbox(f"##corrosive_{name}", entry.corrosive)
+                if changed:
+                    entry.corrosive = v
+                    row_dirty = True
+                if row_dirty:
+                    cost_model.ENGINE.set(name, entry)
+                    any_dirty = True
+            imgui.end_table()
+            if any_dirty:
+                try:
+                    cost_model.ENGINE.save()
+                except OSError:
+                    pass
+
     names = [item["original"] for item in STATE.chemical_knowledge]
     STATE.chemistry_selected_idx = min(STATE.chemistry_selected_idx, len(names) - 1)
     imgui.set_next_item_width(280)
@@ -4945,10 +6581,37 @@ def draw_chemical_knowledge_tab():
 
 def gui():
     """Top-level GUI callback — called every frame by imgui-bundle."""
-    imgui.text("🌿 BioCarbon Screen — AI-assisted hard-carbon synthesis screening")
+    style = imgui.get_style()
+    # -- Title bar --------------------------------------------------------
+    imgui.push_style_color(imgui.Col_.text, _rgba(_PALETTE["accent"]))
+    imgui.text("BioCarbon Screen")
+    imgui.pop_style_color()
     imgui.same_line()
-    # Offer to reuse a previously-saved model.
-    if not STATE.trained and os.path.exists(MODEL_OUT):
+    imgui.push_style_color(imgui.Col_.text, _rgba(_PALETTE["text_dim"]))
+    imgui.text("    AI-assisted hard-carbon synthesis screening")
+    imgui.pop_style_color()
+
+    # Model status + reuse-a-saved-model button, right-aligned.
+    have_saved = os.path.exists(MODEL_OUT)
+    show_load = not STATE.trained and have_saved
+    if STATE.trained:
+        status, status_col = "Model ready", _PALETTE["accent"]
+    elif have_saved:
+        status, status_col = "Saved model on disk", _PALETTE["text_dim"]
+    else:
+        status, status_col = "No model trained yet", _PALETTE["text_dim"]
+    right_w = imgui.calc_text_size(status).x
+    if show_load:
+        load_label = f"Load {MODEL_OUT}"
+        right_w += (imgui.calc_text_size(load_label).x
+                    + style.frame_padding.x * 2 + style.item_spacing.x)
+    imgui.same_line(max(0.0, imgui.get_window_width() - right_w
+                        - style.window_padding.x - 4))
+    imgui.push_style_color(imgui.Col_.text, _rgba(status_col))
+    imgui.text(status)
+    imgui.pop_style_color()
+    if show_load:
+        imgui.same_line()
         if imgui.small_button(f"Load {MODEL_OUT}"):
             try:
                 load_model()
@@ -4958,7 +6621,7 @@ def gui():
 
     if imgui.begin_tab_bar("tabs"):
         # PRIMARY WORKFLOW first — the research-assistant screening view.
-        if imgui.begin_tab_item("🔬 Screen")[0]:
+        if imgui.begin_tab_item("Screen")[0]:
             draw_screen_tab()
             imgui.end_tab_item()
         if imgui.begin_tab_item("Prioritize")[0]:
@@ -4985,6 +6648,9 @@ def gui():
         if imgui.begin_tab_item("Optimize")[0]:
             draw_optimize_tab()
             imgui.end_tab_item()
+        if imgui.begin_tab_item("Suggest Experiments")[0]:
+            draw_bayesopt_tab()
+            imgui.end_tab_item()
         if imgui.begin_tab_item("Charts")[0]:
             draw_charts_tab()
             imgui.end_tab_item()
@@ -4997,15 +6663,239 @@ def gui():
         imgui.end_tab_bar()
 
 
-def main():
-    # image_from_asset resolves paths relative to the assets folder; point it at
-    # the project directory so "charts/xxx.png" loads.
-    hello_imgui.set_assets_folder(os.path.dirname(os.path.abspath(__file__)))
-    immapp.run(
-        gui_function=gui,
-        window_title="BioCarbon Screen",
-        window_size=(1080, 820),
+# =============================================================================
+# APPEARANCE  —  professional "light / clean" theme
+# =============================================================================
+# A calm, report-friendly palette: white panels on a soft grey canvas, a single
+# blue accent reserved for selection / active states, thin borders and gently
+# rounded corners. Applied once at startup via the runner's setup callback.
+
+_PALETTE = {
+    "canvas":        "#f4f5f8",  # app background
+    "surface":       "#ffffff",  # panels / popups / selected tab
+    "surface_alt":   "#eef1f6",  # alt table rows / hovered controls
+    "input":         "#ffffff",  # text inputs, combos, sliders track
+    "input_hover":   "#eef1f6",
+    "input_active":  "#e6ebf4",
+    "border":        "#d8dce4",
+    "border_strong": "#c4cad4",
+    "text":          "#1c2331",
+    "text_dim":      "#6b7482",
+    "accent":        "#2563eb",  # blue-600
+    "accent_hover":  "#3b82f6",
+    "accent_active": "#1d4ed8",
+    "tab_idle":      "#e7eaf1",
+    "scroll_grab":   "#c4cad4",
+    "scroll_hover":  "#a9b1be",
+}
+
+
+def _rgba(hex_str, a=1.0):
+    """'#rrggbb' -> imgui.ImVec4 (linear passthrough, alpha overridable)."""
+    h = hex_str.lstrip("#")
+    return imgui.ImVec4(
+        int(h[0:2], 16) / 255.0,
+        int(h[2:4], 16) / 255.0,
+        int(h[4:6], 16) / 255.0,
+        a,
     )
+
+
+def apply_professional_theme():
+    """Setup callback: geometry + colours for a clean light UI."""
+    style = imgui.get_style()
+
+    # -- geometry -----------------------------------------------------------
+    style.window_padding = imgui.ImVec2(16, 14)
+    style.frame_padding = imgui.ImVec2(11, 6)
+    style.cell_padding = imgui.ImVec2(9, 6)
+    style.item_spacing = imgui.ImVec2(10, 9)
+    style.item_inner_spacing = imgui.ImVec2(8, 6)
+    style.indent_spacing = 22
+    style.scrollbar_size = 13
+    style.grab_min_size = 11
+
+    style.window_border_size = 1
+    style.child_border_size = 1
+    style.popup_border_size = 1
+    style.frame_border_size = 1
+    style.tab_bar_border_size = 1 if hasattr(style, "tab_bar_border_size") else 0
+
+    style.window_rounding = 9
+    style.child_rounding = 9
+    style.frame_rounding = 6
+    style.popup_rounding = 7
+    style.scrollbar_rounding = 9
+    style.grab_rounding = 6
+    style.tab_rounding = 6
+
+    style.window_title_align = imgui.ImVec2(0.0, 0.5)
+    if hasattr(imgui, "Dir"):
+        style.window_menu_button_position = imgui.Dir.none
+    style.anti_aliased_lines = True
+    style.anti_aliased_fill = True
+
+    # -- colours ------------------------------------------------------------
+    p = _PALETTE
+    C = imgui.Col_
+    accent = _rgba(p["accent"])
+    accent_h = _rgba(p["accent_hover"])
+    accent_a = _rgba(p["accent_active"])
+
+    def s(col, hex_or_vec, a=1.0):
+        style.set_color_(col, hex_or_vec if isinstance(hex_or_vec, imgui.ImVec4)
+                         else _rgba(hex_or_vec, a))
+
+    s(C.text, p["text"])
+    s(C.text_disabled, p["text_dim"])
+    s(C.window_bg, p["canvas"])
+    s(C.child_bg, p["surface"])
+    s(C.popup_bg, p["surface"])
+    s(C.border, p["border"])
+    s(C.border_shadow, imgui.ImVec4(0, 0, 0, 0))
+
+    s(C.frame_bg, p["input"])
+    s(C.frame_bg_hovered, p["input_hover"])
+    s(C.frame_bg_active, p["input_active"])
+
+    s(C.title_bg, p["surface"])
+    s(C.title_bg_active, p["surface"])
+    s(C.title_bg_collapsed, p["surface"])
+    s(C.menu_bar_bg, p["surface"])
+
+    s(C.scrollbar_bg, imgui.ImVec4(0, 0, 0, 0))
+    s(C.scrollbar_grab, p["scroll_grab"])
+    s(C.scrollbar_grab_hovered, p["scroll_hover"])
+    s(C.scrollbar_grab_active, p["border_strong"])
+
+    s(C.check_mark, accent)
+    s(C.slider_grab, accent)
+    s(C.slider_grab_active, accent_a)
+
+    # Buttons stay neutral; accent is reserved for state, not chrome.
+    s(C.button, p["surface_alt"])
+    s(C.button_hovered, _rgba(p["accent"], 0.16))
+    s(C.button_active, _rgba(p["accent"], 0.28))
+
+    # Selection surfaces (selectable / tree / collapsing header) read blue-tinted.
+    s(C.header, _rgba(p["accent"], 0.16))
+    s(C.header_hovered, _rgba(p["accent"], 0.24))
+    s(C.header_active, _rgba(p["accent"], 0.32))
+
+    s(C.separator, p["border"])
+    s(C.separator_hovered, accent_h)
+    s(C.separator_active, accent)
+
+    s(C.resize_grip, _rgba(p["accent"], 0.0))
+    s(C.resize_grip_hovered, _rgba(p["accent"], 0.30))
+    s(C.resize_grip_active, _rgba(p["accent"], 0.55))
+
+    # Tabs — flat segmented look, white when selected with a blue overline.
+    s(C.tab, p["tab_idle"])
+    s(C.tab_hovered, _rgba(p["accent"], 0.20))
+    if hasattr(C, "tab_selected"):
+        s(C.tab_selected, p["surface"])
+        s(C.tab_dimmed, p["tab_idle"])
+        s(C.tab_dimmed_selected, p["surface_alt"])
+    if hasattr(C, "tab_selected_overline"):
+        s(C.tab_selected_overline, accent)
+        s(C.tab_dimmed_selected_overline, _rgba(p["accent"], 0.0))
+
+    s(C.text_selected_bg, _rgba(p["accent"], 0.22))
+    s(C.nav_highlight, accent)
+    s(C.drag_drop_target, accent_h)
+    s(C.plot_lines, accent)
+    s(C.plot_lines_hovered, accent_a)
+    s(C.plot_histogram, accent)
+    s(C.plot_histogram_hovered, accent_a)
+
+    # Tables
+    s(C.table_header_bg, p["surface_alt"])
+    s(C.table_border_strong, p["border_strong"])
+    s(C.table_border_light, p["border"])
+    s(C.table_row_bg, imgui.ImVec4(0, 0, 0, 0))
+    s(C.table_row_bg_alt, _rgba(p["surface_alt"], 0.55))
+
+
+_UI_FONT_SIZE = 16.5
+
+
+def _find_roboto():
+    """Locate a Roboto TTF in the frozen bundle, the assets folder, or the
+    imgui_bundle install. Returns None if none is present."""
+    names = ("fonts/Roboto/Roboto-Medium.ttf", "fonts/Roboto/Roboto-Regular.ttf")
+    roots = []
+    if getattr(sys, "frozen", False):
+        roots.append(getattr(sys, "_MEIPASS", None))
+    roots.append(_base_dir())
+    try:
+        import imgui_bundle as _ib
+        roots.append(os.path.join(os.path.dirname(_ib.__file__), "assets"))
+    except Exception:  # noqa: BLE001
+        pass
+    for root in roots:
+        if not root:
+            continue
+        for n in names:
+            p = os.path.join(root, *n.split("/"))
+            if os.path.isfile(p):
+                return p
+    return None
+
+
+def _load_fonts():
+    """Font-loading callback: use Roboto for a clean, modern look. Best-effort —
+    any failure silently falls back to Dear ImGui's built-in font."""
+    try:
+        path = _find_roboto()
+        if not path:
+            return
+        io = imgui.get_io()
+        try:
+            factor = hello_imgui.dpi_font_loading_factor()
+        except Exception:  # noqa: BLE001
+            factor = 1.0
+        font = io.fonts.add_font_from_file_ttf(path, round(_UI_FONT_SIZE * factor))
+        if font is not None:
+            io.font_default = font
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _base_dir():
+    """Writable, stable base folder for assets/model/charts.
+
+    Frozen (PyInstaller one-folder): the directory that holds the .exe.
+    Source run: the project directory next to this file.
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def main():
+    base = _base_dir()
+    # When frozen, anchor relative paths ("charts/", "model.joblib", *.ini) to the
+    # folder next to the .exe so writes and asset lookups resolve to one place.
+    if getattr(sys, "frozen", False):
+        try:
+            os.chdir(base)
+        except OSError:
+            pass
+    # image_from_asset resolves paths relative to the assets folder.
+    hello_imgui.set_assets_folder(base)
+
+    runner_params = hello_imgui.RunnerParams()
+    runner_params.app_window_params.window_title = "BioCarbon Screen"
+    runner_params.app_window_params.window_geometry.size = [1180, 860]
+    runner_params.app_window_params.restore_previous_geometry = True
+    runner_params.imgui_window_params.show_menu_bar = False
+    runner_params.imgui_window_params.background_color = _rgba(_PALETTE["canvas"])
+    runner_params.callbacks.setup_imgui_style = apply_professional_theme
+    runner_params.callbacks.load_additional_fonts = _load_fonts
+    runner_params.callbacks.show_gui = gui
+
+    immapp.run(runner_params)
 
 
 if __name__ == "__main__":

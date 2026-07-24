@@ -5,6 +5,10 @@ __pycache__/
 .venv/
 venv/
 
+# PyInstaller build artifacts (regenerated from BioCarbon_Screen.spec)
+build/
+dist/
+
 # Trained models / run artifacts
 *.joblib
 predictions.csv
