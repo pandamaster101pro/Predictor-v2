@@ -197,6 +197,7 @@ def propose_batch(
     xi: float = 0.01,
     random_state: int = 42,
     de_kwargs: dict | None = None,
+    callback: Callable[[int, int], None] | None = None,
 ) -> List[Proposal]:
     """Propose ``q`` experiments by iterated Expected-Improvement maximization.
 
@@ -222,6 +223,8 @@ def propose_batch(
     work = surrogate
     seen: List[np.ndarray] = []
     for i in range(q):
+        if callback is not None:
+            callback(i, q)
         best_f = work.y_best
 
         def acq_neg(search_vec, _work=work, _best=best_f):

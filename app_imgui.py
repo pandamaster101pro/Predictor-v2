@@ -1359,7 +1359,8 @@ def _rank_top_recipes(archive_vecs, archive_obj, *, target, sign, y, model,
     return top_recipes, n_considered
 
 
-def _search_with_archive(objective_fn, bounds, random_state, de_kwargs):
+def _search_with_archive(objective_fn, bounds, random_state, de_kwargs,
+                         on_generation=None):
     """Run one differential-evolution search, returning (best_vec, archive_vecs,
     archive_obj) — the winning point plus every candidate visited across all
     generations (not just the final population), for the diversity/Pareto
@@ -1387,6 +1388,8 @@ def _search_with_archive(objective_fn, bounds, random_state, de_kwargs):
             archive_vecs.append(np.array(
                 [solver._scale_parameters(p) for p in solver.population]))
             archive_obj.append(solver.population_energies.copy())
+            if on_generation is not None:
+                on_generation(_nit, solver.maxiter)
             if solver.converged():
                 break
         best_i = int(np.argmin(solver.population_energies))
@@ -1401,7 +1404,7 @@ def _search_with_archive(objective_fn, bounds, random_state, de_kwargs):
 def _run_bo_proposals(*, X_enc, y, spec, bounds, integrality, vectorize,
                       decode_vec, annotate_recipe, direction, target, cv_r2,
                       cv_rmse, label_map, fixed, n_rows, n_numeric, n_categorical,
-                      column_type_mode, q, xi, random_state):
+                      column_type_mode, q, xi, random_state, progress=None):
     """Fit a Gaussian-process surrogate on the already-built feature space and
     propose the next ``q`` experiments to run by Expected-Improvement Bayesian
     optimization. Reuses the exact ``vectorize``/``decode_vec``/``annotate_recipe``
@@ -1409,6 +1412,10 @@ def _run_bo_proposals(*, X_enc, y, spec, bounds, integrality, vectorize,
     chemistry descriptors and constraints are identical — only the surrogate and
     the selection criterion differ (probabilistic GP + acquisition, rather than
     a point-model optimum)."""
+    def _p(msg, frac=None):
+        if progress is not None:
+            progress(msg, frac)
+
     notes = []
     bo_direction = "maximize" if direction == "maximise" else "minimize"
     y_best = float(y.max()) if direction == "maximise" else float(y.min())
@@ -1417,13 +1424,18 @@ def _run_bo_proposals(*, X_enc, y, spec, bounds, integrality, vectorize,
         notes.append("No free knobs to vary — every controllable column is "
                      "fixed or constant, so there is nothing to propose.")
     else:
+        _p("Fitting Gaussian-process surrogate over the search space…", 0.45)
         surrogate = bayesopt.fit_surrogate(
             X_enc.astype(float).values, y, direction=bo_direction,
             random_state=random_state)
+        _bo_cb = progress and (lambda i, qq: _p(
+            f"Proposing experiment {i + 1}/{qq} (maximizing Expected "
+            f"Improvement)…", 0.5 + 0.45 * i / max(qq, 1)))
         raw = bayesopt.propose_batch(
             surrogate, bounds, lambda v: vectorize(v), q=q,
             integrality=integrality, xi=xi, random_state=random_state,
-            de_kwargs=dict(popsize=12, maxiter=40))
+            de_kwargs=dict(popsize=12, maxiter=40), callback=_bo_cb or None)
+        _p("Decoding proposed recipes and mapping reagents…", 0.97)
         for rank, p in enumerate(raw, start=1):
             recipe_, edges_ = decode_vec(p.x)
             ordered_, chem_recs_ = annotate_recipe(recipe_)
@@ -1452,7 +1464,7 @@ def run_capacity_optimization(data_path, target, excluded, fixed, direction,
                               top_n=10, risk_lambda=1.0, min_applicability=60.0,
                               constraints_text="", objectives_text="",
                               bayesopt_mode=False, bo_batch=5, bo_xi=0.01,
-                              run_de=True):
+                              run_de=True, progress=None):
     """
     Train XGBoost to predict `target` from CONTROLLABLE inputs only, then use
     differential evolution to find the input recipe with the best predicted
@@ -1498,6 +1510,11 @@ def run_capacity_optimization(data_path, target, excluded, fixed, direction,
     """
     from xgboost import XGBRegressor
 
+    def _p(msg, frac=None):
+        if progress is not None:
+            progress(msg, frac)
+
+    _p("Loading and cleaning the dataset…", 0.04)
     raw_df = read_any(data_path, sheet=sheet)
     label_map = mixed_feature_labels(mixed or [], columns=raw_df.columns)
     generated_cols = set(label_map)
@@ -1632,6 +1649,8 @@ def run_capacity_optimization(data_path, target, excluded, fixed, direction,
     col_pos = {c: i for i, c in enumerate(feat_cols)}
     n_feat = len(feat_cols)
 
+    _p(f"Training surrogate model on {len(search_numeric_cols) + len(cat_choices)} "
+       "knobs (5-fold cross-validation)…", 0.22)
     model = XGBRegressor(n_estimators=400, max_depth=4, learning_rate=0.05,
                          subsample=0.8, colsample_bytree=0.8,
                          random_state=random_state, n_jobs=-1, verbosity=0)
@@ -1641,6 +1660,7 @@ def run_capacity_optimization(data_path, target, excluded, fixed, direction,
     cv_r2 = float(r2_score(y, oof_pred))
     cv_rmse = float(np.sqrt(mean_squared_error(y, oof_pred)))
     model.fit(X_enc.astype(float).values, y)
+    _p(f"Surrogate ready (cross-validated R² = {cv_r2:.2f}).", 0.38)
 
     # Multi-objective setup. objectives[0] is always the primary target above;
     # additional entries either name a controllable knob (no model needed —
@@ -1813,7 +1833,7 @@ def run_capacity_optimization(data_path, target, excluded, fixed, direction,
             cv_r2=cv_r2, cv_rmse=cv_rmse, label_map=label_map, fixed=fixed,
             n_rows=len(df), n_numeric=len(search_numeric_cols),
             n_categorical=len(cat_choices), column_type_mode=column_type_mode,
-            q=bo_batch, xi=bo_xi, random_state=random_state)
+            q=bo_batch, xi=bo_xi, random_state=random_state, progress=progress)
         if not run_de:
             return bo_result
 
@@ -1829,8 +1849,11 @@ def run_capacity_optimization(data_path, target, excluded, fixed, direction,
     # final, tightly-converged population. This is what makes the Top-N
     # diversity pass below meaningful: by convergence DE's population has
     # narrowed to near-duplicates of the single best point.
+    _p("Searching the recipe space (differential evolution)…", 0.42)
+    _de_cb = progress and (lambda g, m: _p(
+        f"Searching recipe space — generation {g}/{m}…", 0.42 + 0.38 * g / max(m, 1)))
     best_vec, archive_vecs, archive_obj = _search_with_archive(
-        objective, bounds, random_state, de_kwargs)
+        objective, bounds, random_state, de_kwargs, on_generation=_de_cb or None)
 
     # Also seed the Top-N candidate pool with real training recipes (what
     # does the fitted model predict for experiments actually run?). A free
@@ -1875,6 +1898,7 @@ def run_capacity_optimization(data_path, target, excluded, fixed, direction,
     sensitivity = _sensitivity_analysis(best_vec, spec, vectorize, model, X_raw,
                                         cat_choices=cat_choices)
 
+    _p("Ranking recommended experiments (uncertainty + applicability)…", 0.82)
     top_recipes, n_candidates_considered = _rank_top_recipes(
         archive_vecs, archive_obj, target=target, sign=sign, y=y, model=model,
         vectorize=vectorize, decode_vec=decode_vec, annotate_recipe=annotate_recipe,
@@ -1891,6 +1915,7 @@ def run_capacity_optimization(data_path, target, excluded, fixed, direction,
     pareto_front = []
     pareto_fronts_summary = []
     if len(objectives) > 1:
+        _p("Computing the multi-objective Pareto front…", 0.9)
         try:
             # Normalise every objective's raw value to roughly [0, 1] (min-max
             # over its OWN observed range) before weighting, so a target
@@ -1972,6 +1997,7 @@ def run_capacity_optimization(data_path, target, excluded, fixed, direction,
     # Pareto-front tradeoff explanation, and training-data coverage gaps.
     # All best-effort over data already computed above — never able to
     # affect the search or the single-best/Top-N/Pareto results themselves.
+    _p("Scoring cost, sustainability, feasibility, and coverage gaps…", 0.95)
     try:
         top_recipes = planner.enrich_candidates(top_recipes) if top_recipes else top_recipes
         for cand in top_recipes:
@@ -2033,6 +2059,104 @@ def run_capacity_optimization(data_path, target, excluded, fixed, direction,
 
 
 # =============================================================================
+# PROGRESS  (shared, visible feedback for every long-running background task)
+# =============================================================================
+class Progress:
+    """Progress state for one long operation, driven from a worker thread and
+    rendered every frame by ``draw_progress_panel``. Workers call
+    ``begin()`` / ``step()`` / ``finish()`` / ``fail()``; the UI shows a real
+    progress bar, an elapsed-time readout, and a live, timestamped log of every
+    step so the user can watch the processing happen rather than staring at a
+    frozen window."""
+
+    def __init__(self, idle_message=""):
+        self.idle_message = idle_message
+        self.active = False
+        self.finished_ok = False
+        self.fraction = 0.0
+        self.message = idle_message
+        self.error = ""
+        self.log = []            # list of (elapsed_seconds, text)
+        self.elapsed = 0.0
+        self._t0 = 0.0
+
+    def begin(self, message="Starting…"):
+        self.active = True
+        self.finished_ok = False
+        self.fraction = 0.0
+        self.error = ""
+        self.log = []
+        self._t0 = time.time()
+        self.step(message, 0.0)
+
+    def step(self, message, fraction=None):
+        if fraction is not None:
+            self.fraction = max(0.0, min(1.0, float(fraction)))
+        self.message = message
+        self.elapsed = (time.time() - self._t0) if self._t0 else 0.0
+        self.log.append((self.elapsed, message))
+
+    def finish(self, message="Done."):
+        self.step(message, 1.0)
+        self.active = False
+        self.finished_ok = True
+
+    def fail(self, message):
+        self.error = message
+        self.step("Failed.")
+        self.active = False
+
+    def sub(self, lo, hi):
+        """Return a ``(message, frac)`` callback mapping frac in [0,1] onto the
+        band [lo, hi] — lets a nested loop (DE generations, BO proposals) report
+        its own 0→1 progress into a slice of the overall bar."""
+        def cb(message, frac=None):
+            if frac is None:
+                self.step(message)
+            else:
+                self.step(message, lo + (hi - lo) * max(0.0, min(1.0, float(frac))))
+        return cb
+
+
+def draw_progress_panel(prog, *, show_when_idle=False, log_height=150):
+    """Render a Progress object: coloured bar + status + elapsed + live log."""
+    if not (prog.active or prog.finished_ok or prog.error or show_when_idle):
+        return
+    frac = 1.0 if prog.finished_ok else prog.fraction
+    if prog.error:
+        fill = _rgba("#c62828")
+    elif prog.finished_ok:
+        fill = _rgba("#2e7d32")
+    else:
+        fill = _rgba(_PALETTE["accent"])
+    imgui.push_style_color(imgui.Col_.plot_histogram, fill)
+    imgui.progress_bar(frac, imgui.ImVec2(-1.0, 0.0), f"{int(round(frac * 100))}%")
+    imgui.pop_style_color()
+
+    if prog.active:
+        spin = " " + "|/-\\"[int(time.time() * 8) % 4]
+    else:
+        spin = ""
+    status_col = _rgba("#c62828") if prog.error else DIM
+    imgui.text_colored(status_col, f"{prog.message}{spin}    ({prog.elapsed:.1f}s)")
+
+    if prog.log:
+        node = imgui.tree_node(
+            f"Processing details — {len(prog.log)} step(s)###plog{id(prog)}")
+        if node:
+            # begin_child must always be matched by end_child, even when it
+            # returns false (content clipped) — hence the unconditional pair.
+            imgui.begin_child(f"##log{id(prog)}", imgui.ImVec2(0.0, log_height),
+                              imgui.ChildFlags_.border)
+            for t, msg in prog.log[-300:]:
+                imgui.text_colored(DIM, f"[{t:6.1f}s]  {msg}")
+            if prog.active:                     # follow the tail while running
+                imgui.set_scroll_here_y(1.0)
+            imgui.end_child()
+            imgui.tree_pop()
+
+
+# =============================================================================
 # APPLICATION STATE  (immediate-mode UI redraws every frame; state lives here)
 # =============================================================================
 class AppState:
@@ -2089,6 +2213,15 @@ class AppState:
         self.batch_dialog = None
         self.json_dialog = None
         self.json_save_dialog = None
+
+        # --- Progress trackers (one per long-running background task; each
+        # drives a visible bar + live processing log via draw_progress_panel) ---
+        self.prog_train = Progress()
+        self.prog_compare = Progress()
+        self.prog_opt = Progress()
+        self.prog_bo = Progress()
+        self.prog_charts = Progress()
+        self.prog_intel = Progress()
 
         # --- Training status (written by the background thread) ---
         self.is_training = False
@@ -2217,6 +2350,10 @@ class AppState:
         self.charts_run = 0                # bumped each run -> unique names (texture cache)
         self.slideshow_dialog = None       # async save-file dialog for the slideshow
         self.slideshow_status = ""         # result message for the slideshow export
+        # Charts render into CHART_DIR only as a transient display cache (wiped
+        # at startup); "Save charts…" exports the current ones to a chosen folder.
+        self.save_charts_dialog = None     # async select-folder dialog
+        self.save_charts_status = ""
 
         # --- Latent Variables tab ---
         self.lat_columns = []              # available columns (from file/sheet)
@@ -2757,11 +2894,13 @@ def start_training():
 
 def _train_worker(cfg):
     """Train in the background using the shared leakage-safe validation engine."""
+    STATE.prog_train.begin("Loading and cleaning data…")
     try:
         STATE.status = "Loading and cleaning data..."
         STATE.progress = 0.2
         targets = list(cfg["targets"])
         clean_notes = []
+        STATE.prog_train.step("Encoding features and chemistry descriptors…", 0.35)
         data = build_training_data(cfg, notes=clean_notes)
         X_raw = data["X_raw"]
         X_enc = data["X_encoded"]
@@ -2786,6 +2925,7 @@ def _train_worker(cfg):
         validation_label = V.validation_method_label(cfg["validation"])
         STATE.status = f"Evaluating with {validation_label}..."
         STATE.progress = 0.5
+        STATE.prog_train.step(f"Cross-validating ({validation_label})…", 0.55)
         evaluation = V.evaluate_model_cv(
             model, X_raw, y, cfg["validation"], groups=groups,
             numeric_columns=list(numeric_schema),
@@ -2794,6 +2934,7 @@ def _train_worker(cfg):
 
         STATE.status = "Fitting final model on all usable rows..."
         STATE.progress = 0.9
+        STATE.prog_train.step("Fitting final model on all usable rows…", 0.9)
         fit_y = y.iloc[:, 0] if len(targets) == 1 else y
         model.fit(X_enc, fit_y)
         pred_tr = np.asarray(model.predict(X_enc), dtype=float)
@@ -2873,10 +3014,13 @@ def _train_worker(cfg):
         STATE.trained = True
         STATE.status = "Done. Review the grouped OOF metrics below, then use Predict."
         STATE.progress = 1.0
+        STATE.prog_train.finish(
+            f"Trained — pooled OOF R² = {mean_cv:.3f} on {len(X_enc)} rows.")
     except Exception as e:  # noqa: BLE001
         STATE.train_error = f"{type(e).__name__}: {e}"
         STATE.status = "Training failed."
         STATE.progress = 0.0
+        STATE.prog_train.fail(f"{type(e).__name__}: {e}")
     finally:
         STATE.is_training = False
 
@@ -2911,11 +3055,13 @@ def _comparison_estimator(model, n_targets):
 
 
 def _compare_worker(cfg):
+    STATE.prog_compare.begin("Loading and cleaning data…")
     try:
         data = build_training_data(cfg)
         X, y, groups = data["X_raw"], data["y"], data["groups"]
         numeric = list(data["numeric_schema"])
         categorical = list(data["categorical_schema"])
+        STATE.prog_compare.step("Assembling model architectures…", 0.05)
         models = build_models()
         STATE.compare_total = len(models)
         validation_label = V.validation_method_label(cfg["validation"])
@@ -2935,6 +3081,9 @@ def _compare_worker(cfg):
                 f"Evaluating {name} with {validation_label} "
                 f"({STATE.compare_done + 1}/{STATE.compare_total})..."
             )
+            STATE.prog_compare.step(
+                f"Evaluating {name} ({STATE.compare_done + 1}/{STATE.compare_total})…",
+                0.05 + 0.9 * STATE.compare_done / max(STATE.compare_total, 1))
             t0 = time.time()
             row = {"name": name, "runtime": float("nan"),
                    "train_r2": float("nan"), "predict_ms": float("nan")}
@@ -2985,9 +3134,12 @@ def _compare_worker(cfg):
         except Exception as e:  # noqa: BLE001
             print(f"[compare chart] failed: {e}")
         STATE.compare_status = f"Done. Benchmarked {STATE.compare_total} architectures."
+        STATE.prog_compare.finish(
+            f"Done — {STATE.compare_total} architectures benchmarked.")
     except Exception as e:  # noqa: BLE001
         STATE.compare_error = f"{type(e).__name__}: {e}"
         STATE.compare_status = "Comparison failed."
+        STATE.prog_compare.fail(f"{type(e).__name__}: {e}")
     finally:
         STATE.is_comparing = False
 
@@ -3058,6 +3210,7 @@ def start_optimize():
 
 
 def _optimize_worker(cfg):
+    STATE.prog_opt.begin("Starting optimization…")
     try:
         STATE.opt_status = "Training + searching (this can take a minute)…"
         res = run_capacity_optimization(
@@ -3071,7 +3224,8 @@ def _optimize_worker(cfg):
             top_n=cfg.get("top_n", 10), risk_lambda=cfg.get("risk_lambda", 1.0),
             min_applicability=cfg.get("min_applicability", 60.0),
             constraints_text=cfg.get("constraints_text", ""),
-            objectives_text=cfg.get("objectives_text", ""))
+            objectives_text=cfg.get("objectives_text", ""),
+            progress=STATE.prog_opt.step)
         STATE.opt_result = res
         src = ("column-type roles" if res.get("mode") == "column-type"
                else "manual exclusions")
@@ -3085,9 +3239,11 @@ def _optimize_worker(cfg):
             f"({res.get('n_numeric', 0)} numeric / {res.get('n_categorical', 0)} categorical). "
             f"{n_top} recommended experiment(s) from "
             f"{res.get('n_candidates_considered', 0)} candidates considered{pareto_bit}.")
+        STATE.prog_opt.finish(f"Done — {n_top} experiment(s) recommended.")
     except Exception as e:  # noqa: BLE001
         STATE.opt_error = f"{type(e).__name__}: {e}"
         STATE.opt_status = "Optimization failed."
+        STATE.prog_opt.fail(f"{type(e).__name__}: {e}")
     finally:
         STATE.is_optimizing = False
 
@@ -3143,6 +3299,7 @@ def start_bayesopt():
 
 
 def _bayesopt_worker(cfg):
+    STATE.prog_bo.begin("Starting Bayesian optimization…")
     try:
         STATE.bo_status = "Fitting GP surrogate + maximizing acquisition…"
         res = run_capacity_optimization(
@@ -3155,7 +3312,8 @@ def _bayesopt_worker(cfg):
             chemistry_mode=cfg.get("chemistry_mode", "automatic"),
             constraints_text=cfg.get("constraints_text", ""),
             bayesopt_mode=True, run_de=False,
-            bo_batch=cfg.get("bo_batch", 5), bo_xi=cfg.get("bo_xi", 0.01))
+            bo_batch=cfg.get("bo_batch", 5), bo_xi=cfg.get("bo_xi", 0.01),
+            progress=STATE.prog_bo.step)
         STATE.bo_result = res
         src = ("column-type roles" if res.get("mode") == "column-type"
                else "manual exclusions")
@@ -3164,9 +3322,12 @@ def _bayesopt_worker(cfg):
             f"{res['n_knobs']} knobs "
             f"({res.get('n_numeric', 0)} numeric / {res.get('n_categorical', 0)} "
             f"categorical). {len(res.get('proposals', []))} experiment(s) proposed.")
+        STATE.prog_bo.finish(
+            f"Done — {len(res.get('proposals', []))} experiment(s) proposed.")
     except Exception as e:  # noqa: BLE001
         STATE.bo_error = f"{type(e).__name__}: {e}"
         STATE.bo_status = "Suggestion failed."
+        STATE.prog_bo.fail(f"{type(e).__name__}: {e}")
     finally:
         STATE.is_bayesopt = False
 
@@ -3235,7 +3396,13 @@ def _charts_worker(cfg, opts):
         targets = cfg["targets"]
         ti = min(max(opts["target_idx"], 0), len(targets) - 1)
 
-        STATE.charts_status = "Loading & cleaning data…"
+        STATE.prog_charts.begin("Loading & cleaning data…")
+
+        def cs(msg, i):
+            STATE.charts_status = msg
+            STATE.prog_charts.step(msg, i / 13.0)
+
+        cs("Loading & cleaning data…", 0)
         data = build_training_data(cfg)
         X_enc, y = data["X_encoded"], data["y"]
         numeric_schema = data["numeric_schema"]
@@ -3246,7 +3413,7 @@ def _charts_worker(cfg, opts):
         validation_title = validation_label + (f" by {grouping}" if grouping else "")
 
         # Correlation and target-signal analysis.
-        STATE.charts_status = "1/13 · correlation analysis…"
+        cs("1/13 · correlation analysis…", 1)
         corr_df = pd.concat(
             [X_enc[numeric_feats].reset_index(drop=True), y.reset_index(drop=True)],
             axis=1,
@@ -3269,7 +3436,7 @@ def _charts_worker(cfg, opts):
                       C.model_performance_summary(STATE.metrics, path("model_perf"))))
 
         # Out-of-fold predictions (shared by charts 2 & 3), same model as training.
-        STATE.charts_status = "6/13 · out-of-fold predictions…"
+        cs("6/13 · out-of-fold predictions…", 6)
         if STATE.oof_predictions is None or len(STATE.oof_predictions) != len(y):
             base = ExtraTreesRegressor(
                 n_estimators=300, max_depth=12, min_samples_split=4,
@@ -3290,7 +3457,7 @@ def _charts_worker(cfg, opts):
         items.append(("Predicted vs actual",
                       C.predicted_vs_actual(y.values, oof, targets, path("pva"), r2_by,
                                             validation_method=validation_title)))
-        STATE.charts_status = "7/13 · residual diagnostics…"
+        cs("7/13 · residual diagnostics…", 7)
         items.append(("Residual plot",
                       C.residual_plot(y.values, oof, targets, path("resid"),
                                       validation_method=validation_title)))
@@ -3302,7 +3469,7 @@ def _charts_worker(cfg, opts):
                                                validation_method=validation_title)))
 
         # 4. Feature importance (folded back to source columns).
-        STATE.charts_status = "9/13 · feature importance…"
+        cs("9/13 · feature importance…", 9)
         imp_src = _aggregate_importance(STATE.importances, numeric_schema, categorical_schema)
         top = opts.get("imp_top", 20)
         items.append(("Feature importance", C.feature_importance(
@@ -3315,17 +3482,17 @@ def _charts_worker(cfg, opts):
         est = (STATE.model.estimators_[ti]
                if len(targets) > 1 and hasattr(STATE.model, "estimators_")
                else STATE.model)
-        STATE.charts_status = "10/13 · SHAP summary (can be slow)…"
+        cs("10/13 · SHAP summary (can be slow)…", 10)
         items.append(("SHAP summary",
                       C.shap_summary(est, Xs_shap, path("shap_sum"), targets[ti],
                                      display_labels=STATE.feature_labels)))
-        STATE.charts_status = "11/13 · SHAP dependence…"
+        cs("11/13 · SHAP dependence…", 11)
         items.append(("SHAP dependence",
                       C.shap_dependence(est, Xs_shap, path("shap_dep"), targets[ti],
                                         display_labels=STATE.feature_labels)))
 
         # 7. Optimization heatmap — sweep two numeric knobs through the model.
-        STATE.charts_status = "12/13 · optimization heatmap…"
+        cs("12/13 · optimization heatmap…", 12)
         fx, fy = opts.get("featx"), opts.get("featy")
         if fx not in numeric_feats or fy not in numeric_feats or fx == fy:
             ranked = [f for f in sorted(imp_src, key=lambda k: -imp_src[k])
@@ -3350,7 +3517,7 @@ def _charts_worker(cfg, opts):
                 "Need at least two numeric features to sweep.")))
 
         # Pareto front — trade-off between two targets (both maximised).
-        STATE.charts_status = "13/13 · Pareto front…"
+        cs("13/13 · Pareto front…", 13)
         if len(targets) >= 2:
             a = targets[min(max(opts["pareto_a"], 0), len(targets) - 1)]
             b = targets[min(max(opts["pareto_b"], 0), len(targets) - 1)]
@@ -3361,9 +3528,11 @@ def _charts_worker(cfg, opts):
 
         STATE.chart_items = items
         STATE.charts_status = f"Done. Generated {len(items)} charts."
+        STATE.prog_charts.finish(f"Done — {len(items)} charts generated.")
     except Exception as e:  # noqa: BLE001
         STATE.charts_error = f"{type(e).__name__}: {e}"
         STATE.charts_status = "Chart generation failed."
+        STATE.prog_charts.fail(f"{type(e).__name__}: {e}")
     finally:
         STATE.is_charting = False
 
@@ -3605,8 +3774,14 @@ def _intel_worker(cfg, opts):
         def path(name):
             return f"{CHART_DIR}/intel_{name}_{rid}.png"
 
+        STATE.prog_intel.begin("Loading data…")
+        _intel_step = [0]
+        _intel_total = 11
+
         def prog(msg):
             STATE.intel_status = msg
+            _intel_step[0] += 1
+            STATE.prog_intel.step(msg, min(_intel_step[0] / _intel_total, 0.98))
 
         prog("Loading data…")
         df = read_any(STATE.data_path, sheet=opts["sheet"])
@@ -3756,9 +3931,12 @@ def _intel_worker(cfg, opts):
         STATE.intel_conclusion = conclusion
         STATE.intel_status = (f"Done. Difficulty: {diff['label']} · best CV R²="
                               f"{learn['best_r2']:.3f}. See findings below.")
+        STATE.prog_intel.finish(f"Done — difficulty {diff['label']}, "
+                                f"best CV R² = {learn['best_r2']:.3f}.")
     except Exception as e:  # noqa: BLE001
         STATE.intel_error = f"{type(e).__name__}: {e}"
         STATE.intel_status = "Dataset Intelligence failed."
+        STATE.prog_intel.fail(f"{type(e).__name__}: {e}")
     finally:
         STATE.is_intel_running = False
 
@@ -3771,6 +3949,60 @@ def _top_features_for_summary(n=5):
                                 STATE.categorical_schema)
     ranked = sorted(agg.items(), key=lambda kv: -kv[1])[:n]
     return [(pretty(name), val) for name, val in ranked]
+
+
+def _reset_chart_cache():
+    """Wipe the transient chart-render cache (CHART_DIR) at startup so generated
+    charts never accumulate on disk between sessions. Charts are only kept when
+    the user explicitly exports them with the 'Save charts…' button."""
+    exts = (".png", ".svg", ".pdf", ".txt", ".json")
+    try:
+        if os.path.isdir(CHART_DIR):
+            for f in os.listdir(CHART_DIR):
+                if f.lower().endswith(exts):
+                    try:
+                        os.remove(os.path.join(CHART_DIR, f))
+                    except OSError:
+                        pass
+    except OSError:
+        pass
+
+
+def save_charts_to_folder(folder):
+    """Copy every chart generated this session (diagnostics + latent + dataset
+    intelligence) into ``folder`` with readable, ordered filenames. This is the
+    explicit, user-controlled save — generation itself only writes a transient
+    display cache."""
+    import shutil
+
+    sections = []
+    if STATE.chart_items:
+        sections.append(("diagnostics", STATE.chart_items))
+    if STATE.lat_chart_items:
+        sections.append(("latent", STATE.lat_chart_items))
+    if STATE.intel_chart_items:
+        sections.append(("intelligence", STATE.intel_chart_items))
+    if not sections:
+        STATE.save_charts_status = "Generate charts first, then save."
+        return
+    saved = 0
+    try:
+        os.makedirs(folder, exist_ok=True)
+        for section, items in sections:
+            for i, (title, rel) in enumerate(items, 1):
+                src = os.path.abspath(rel)
+                if not os.path.exists(src):
+                    continue
+                safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(title)).strip("_") or "chart"
+                dst = os.path.join(folder, f"{section}_{i:02d}_{safe}.png")
+                shutil.copy2(src, dst)
+                saved += 1
+                note = os.path.splitext(src)[0] + ".txt"   # optional sidecar note
+                if os.path.exists(note):
+                    shutil.copy2(note, os.path.splitext(dst)[0] + ".txt")
+        STATE.save_charts_status = f"Saved {saved} chart(s) to {folder}"
+    except Exception as e:  # noqa: BLE001
+        STATE.save_charts_status = f"Save failed: {e}"
 
 
 def export_slideshow(path):
@@ -4406,16 +4638,19 @@ def draw_train_tab():
     imgui.text("4) Train")
     imgui.text_colored(DIM, "Imputation and one-hot encoding are fitted inside every CV fold.")
     # Guard clicks while a run is in progress.
-    if imgui.button("Train model", size=imgui.ImVec2(140, 0)):
+    imgui.begin_disabled(STATE.is_training)
+    if imgui.button("Training…" if STATE.is_training else "Train model",
+                    size=imgui.ImVec2(140, 0)):
         start_training()
+    imgui.end_disabled()
     imgui.same_line()
     if STATE.trained and imgui.button("Save model", size=imgui.ImVec2(120, 0)):
         save_model()
         STATE.status = f"Saved to '{MODEL_OUT}'."
 
-    # Progress + status line.
+    # Live progress bar + processing log + status line.
     imgui.dummy(imgui.ImVec2(0, 4))
-    imgui.progress_bar(STATE.progress, imgui.ImVec2(-1, 0))
+    draw_progress_panel(STATE.prog_train)
     imgui.text_colored(RED if STATE.train_error else DIM, STATE.status)
     if STATE.train_error:
         imgui.text_wrapped(STATE.train_error)
@@ -4770,13 +5005,14 @@ def draw_compare_tab():
     if summary:
         imgui.text(f"Independent groups: {summary['n_groups']}")
 
-    if imgui.button("Run model comparison", size=imgui.ImVec2(220, 0)):
+    imgui.begin_disabled(STATE.is_comparing)
+    if imgui.button("Running…" if STATE.is_comparing else "Run model comparison",
+                    size=imgui.ImVec2(220, 0)):
         start_comparison()
+    imgui.end_disabled()
 
-    # Progress: fraction of models completed.
-    frac = (STATE.compare_done / STATE.compare_total) if STATE.compare_total else 0.0
-    imgui.progress_bar(frac, imgui.ImVec2(-1, 0),
-                       f"{STATE.compare_done}/{STATE.compare_total}" if STATE.compare_total else "")
+    # Live progress bar (fraction of models completed) + processing log.
+    draw_progress_panel(STATE.prog_compare)
     imgui.text_colored(RED if STATE.compare_error else DIM, STATE.compare_status)
     if STATE.compare_error:
         imgui.text_wrapped(STATE.compare_error)
@@ -4988,9 +5224,13 @@ def draw_optimize_tab():
             "##excluded", STATE.opt_excluded, imgui.ImVec2(-1, 80))
         imgui.tree_pop()
 
-    if imgui.button("Run optimization", size=imgui.ImVec2(200, 0)):
+    imgui.begin_disabled(STATE.is_optimizing)
+    if imgui.button("Running…" if STATE.is_optimizing else "Run optimization",
+                    size=imgui.ImVec2(200, 0)):
         start_optimize()
+    imgui.end_disabled()
     imgui.text_colored(RED if STATE.opt_error else DIM, STATE.opt_status)
+    draw_progress_panel(STATE.prog_opt)
     if STATE.opt_error:
         imgui.text_wrapped(STATE.opt_error)
 
@@ -5492,12 +5732,16 @@ def draw_bayesopt_tab():
     imgui.same_line()
     imgui.text_colored(DIM, "higher = bolder, more exploratory picks")
 
-    if imgui.button("Suggest experiments", size=imgui.ImVec2(220, 0)):
+    imgui.begin_disabled(STATE.is_bayesopt)
+    if imgui.button("Suggesting…" if STATE.is_bayesopt else "Suggest experiments",
+                    size=imgui.ImVec2(220, 0)):
         start_bayesopt()
+    imgui.end_disabled()
     imgui.same_line()
     imgui.text_colored(DIM, "Shares target / constraints / fixed knobs with the "
                        "Optimize tab.")
     imgui.text_colored(RED if STATE.bo_error else DIM, STATE.bo_status)
+    draw_progress_panel(STATE.prog_bo)
     if STATE.bo_error:
         imgui.text_wrapped(STATE.bo_error)
 
@@ -5622,25 +5866,43 @@ def draw_charts_tab():
         if r:
             export_slideshow(r)
         STATE.slideshow_dialog = None
+    # Poll the async "Save charts…" folder picker.
+    if STATE.save_charts_dialog is not None and STATE.save_charts_dialog.ready():
+        folder = STATE.save_charts_dialog.result()
+        if folder:
+            save_charts_to_folder(folder)
+        STATE.save_charts_dialog = None
 
     imgui.dummy(imgui.ImVec2(0, 4))
-    if imgui.button("Generate charts", size=imgui.ImVec2(200, 0)):
+    imgui.begin_disabled(STATE.is_charting)
+    if imgui.button("Generating…" if STATE.is_charting else "Generate charts",
+                    size=imgui.ImVec2(200, 0)):
         start_charts()
+    imgui.end_disabled()
     have_charts = bool(STATE.chart_items or STATE.lat_chart_items or STATE.intel_chart_items)
     if have_charts:
+        imgui.same_line()
+        if imgui.button("Save charts…", size=imgui.ImVec2(140, 0)):
+            STATE.save_charts_status = ""
+            STATE.save_charts_dialog = pfd.select_folder(
+                "Choose a folder to save the charts")
         imgui.same_line()
         if imgui.button("Create slideshow summary", size=imgui.ImVec2(220, 0)):
             STATE.slideshow_dialog = pfd.save_file(
                 "Save slideshow summary", "BioCarbon_summary_slideshow.pdf",
                 filters=["PDF", "*.pdf"])
         imgui.same_line()
-        imgui.text_colored(DIM, "narrated PDF: one slide per chart + a conclusion")
+        imgui.text_colored(DIM, "Charts are only kept on disk when you save them.")
+    draw_progress_panel(STATE.prog_charts)
     imgui.text_colored(RED if STATE.charts_error else DIM, STATE.charts_status)
     if STATE.charts_error:
         imgui.text_wrapped(STATE.charts_error)
     if STATE.slideshow_status:
         imgui.text_colored(GREEN if "Saved" in STATE.slideshow_status else RED,
                            STATE.slideshow_status)
+    if STATE.save_charts_status:
+        imgui.text_colored(GREEN if "Saved" in STATE.save_charts_status else RED,
+                           STATE.save_charts_status)
 
     if STATE.chart_items:
         imgui.separator()
@@ -5822,12 +6084,16 @@ def draw_intelligence_tab():
     _, STATE.intel_pca_components = imgui.slider_int("PCA components", STATE.intel_pca_components, 2, 10)
 
     imgui.dummy(imgui.ImVec2(0, 4))
-    if imgui.button("Run analysis", size=imgui.ImVec2(200, 0)):
+    imgui.begin_disabled(STATE.is_intel_running)
+    if imgui.button("Analysing…" if STATE.is_intel_running else "Run analysis",
+                    size=imgui.ImVec2(200, 0)):
         start_intelligence()
+    imgui.end_disabled()
     if STATE.intel_results:
         imgui.same_line()
         if imgui.button("Export PDF report", size=imgui.ImVec2(180, 0)):
             intel_export_pdf()
+    draw_progress_panel(STATE.prog_intel)
     imgui.text_colored(RED if STATE.intel_error else DIM, STATE.intel_status)
     if STATE.intel_error:
         imgui.text_wrapped(STATE.intel_error)
@@ -6884,6 +7150,9 @@ def main():
             pass
     # image_from_asset resolves paths relative to the assets folder.
     hello_imgui.set_assets_folder(base)
+    # Charts are a transient display cache — clear any left over from prior runs
+    # so nothing accumulates on disk; the user keeps charts via "Save charts…".
+    _reset_chart_cache()
 
     runner_params = hello_imgui.RunnerParams()
     runner_params.app_window_params.window_title = "BioCarbon Screen"
